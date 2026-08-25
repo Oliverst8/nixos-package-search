@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 /// user can see what's about to happen before they hit Enter.
 pub fn command_preview(channel: Channel, hit: &PackageHit) -> String {
     format!(
-        "nix shell {}#{} --command {}",
+        "NIXPKGS_ALLOW_UNFREE=1 nix shell --impure {}#{} --command {}",
         channel.flake_ref(),
         hit.attr_name,
         hit.runnable()
@@ -47,10 +47,19 @@ pub fn launch(channel: Channel, hit: &PackageHit) -> io::Result<Launching> {
             "--extra-experimental-features",
             "nix-command flakes",
             "shell",
+            // Needed for NIXPKGS_ALLOW_UNFREE below to actually apply: nix
+            // won't read environment variables during flake evaluation
+            // unless run impurely. Without this, anything unfree (Chrome,
+            // Steam, ...) fails immediately with a license-refusal error.
+            "--impure",
             &flake_ref,
             "--command",
             &program,
         ])
+        // So packages like google-chrome (license = unfree) don't get
+        // refused outright — matches what people expect from "search and
+        // launch anything", not just free-licensed packages.
+        .env("NIXPKGS_ALLOW_UNFREE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))

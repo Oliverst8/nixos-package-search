@@ -65,14 +65,18 @@ nixpkgs locally.
 Launching runs:
 
 ```sh
-setsid nix --extra-experimental-features "nix-command flakes" shell \
-  github:NixOS/nixpkgs/nixos-<channel>#<attr> --command <mainProgram>
+NIXPKGS_ALLOW_UNFREE=1 setsid nix --extra-experimental-features "nix-command flakes" \
+  shell --impure github:NixOS/nixpkgs/nixos-<channel>#<attr> --command <mainProgram>
 ```
 
 `mainProgram` comes straight from the package's metadata (falling back to
 the package name), so the right binary gets run even when it doesn't match
 the attribute name — e.g. `google-chrome` → `google-chrome-stable`.
 `setsid` detaches the process so it keeps running after the popup exits.
+`NIXPKGS_ALLOW_UNFREE=1`/`--impure` are there so unfree packages (Chrome,
+Steam, ...) actually launch instead of failing with a license-refusal error
+— `--impure` is required for the env var to have any effect during flake
+evaluation, which is otherwise pure.
 stdout/stderr are redirected to a temp file (not a pipe or `/dev/null`) so
 the app can tail it for the loading screen's status line without risking a
 `SIGPIPE` in the launched program if the popup exits while it's still

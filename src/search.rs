@@ -75,29 +75,49 @@ impl SearchMode {
 /// (single whole-string token) instead of the field's own `edge_ngram`
 /// analyzer, which — if used at query time too — shreds the query itself
 /// into ["c","ch","chr",...] and floods the results with noise.
+///
+/// nixpkgs names are hyphenated ("google-chrome"), but people type spaces
+/// ("google chrome"). Neither the exact-`term` nor the substring-`wildcard`
+/// clauses above match across that difference, since to Elasticsearch
+/// "google chrome" and "google-chrome" are just different strings. So on
+/// top of the per-word substring clauses, this also tries a
+/// space-to-hyphen-normalized phrase against the same fields with a big
+/// boost — that's what makes "google chrome" resolve to `google-chrome` as
+/// the clear #1 result instead of a tie with every other package that
+/// happens to mention "google" or "chrome" somewhere.
 fn match_search(query: &str) -> serde_json::Value {
-    json!({
-        "dis_max": {
-            "tie_breaker": 0.3,
-            "queries": [
-                { "term": { "package_attr_name": { "value": query, "boost": 200 } } },
-                { "term": { "package_pname": { "value": query, "boost": 180 } } },
-                { "wildcard": { "package_attr_name": { "value": format!("*{query}*"), "case_insensitive": true, "boost": 50 } } },
-                { "wildcard": { "package_pname": { "value": format!("*{query}*"), "case_insensitive": true, "boost": 45 } } },
-                { "wildcard": { "package_programs": { "value": format!("*{query}*"), "case_insensitive": true, "boost": 40 } } },
-                { "multi_match": {
-                    "query": query,
-                    "analyzer": "lowercase",
-                    "type": "bool_prefix",
-                    "fields": ["package_attr_name.edge^9", "package_pname.edge^7", "package_programs.edge^4"]
-                }},
-                { "multi_match": {
-                    "query": query,
-                    "fields": ["package_description^1.4", "package_longDescription^1"]
-                }}
-            ]
+    let lower = query.trim().to_lowercase();
+    let hyphenated = lower.split_whitespace().collect::<Vec<_>>().join("-");
+
+    let mut queries = vec![
+        json!({ "term": { "package_attr_name": { "value": &hyphenated, "boost": 300 } } }),
+        json!({ "term": { "package_pname": { "value": &hyphenated, "boost": 280 } } }),
+        json!({ "wildcard": { "package_attr_name": { "value": format!("*{hyphenated}*"), "case_insensitive": true, "boost": 120 } } }),
+        json!({ "wildcard": { "package_pname": { "value": format!("*{hyphenated}*"), "case_insensitive": true, "boost": 110 } } }),
+    ];
+
+    for term in lower.split_whitespace() {
+        queries.push(json!({ "wildcard": { "package_attr_name": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 50 } } }));
+        queries.push(json!({ "wildcard": { "package_pname": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 45 } } }));
+        queries.push(json!({ "wildcard": { "package_programs": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 40 } } }));
+    }
+
+    queries.push(json!({
+        "multi_match": {
+            "query": query,
+            "analyzer": "lowercase",
+            "type": "bool_prefix",
+            "fields": ["package_attr_name.edge^9", "package_pname.edge^7", "package_programs.edge^4"]
         }
-    })
+    }));
+    queries.push(json!({
+        "multi_match": {
+            "query": query,
+            "fields": ["package_description^1.4", "package_longDescription^1"]
+        }
+    }));
+
+    json!({ "dis_max": { "tie_breaker": 0.3, "queries": queries } })
 }
 
 /// Mirrors `nix-search-cli`'s `MatchProgram`: prefix + exact match against
@@ -177,6 +197,14 @@ mod tests {
         let client = reqwest::blocking::Client::new();
         let hits = run_search(&client, CHANNELS[0], SearchMode::Packages, "chrome").unwrap();
         assert!(hits.iter().any(|h| h.attr_name == "google-chrome"), "{hits:#?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn packages_mode_ranks_spaced_name_first() {
+        let client = reqwest::blocking::Client::new();
+        let hits = run_search(&client, CHANNELS[0], SearchMode::Packages, "google chrome").unwrap();
+        assert_eq!(hits[0].attr_name, "google-chrome", "{hits:#?}");
     }
 
     #[test]

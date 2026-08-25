@@ -33,9 +33,17 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
 - **Hover** a result (or use ↑/↓) to see its full description, license,
   maintainers, homepage, provided binaries, and nixpkgs source position in
   the right-hand panel.
-- **Enter** or double-click launches the hovered/selected package and closes
-  the popup. The exact command it's about to run is shown at the bottom of
-  the detail panel.
+- **Enter** or double-click launches the hovered/selected package. This
+  shows a loading screen (with the live tail of `nix`'s own output as the
+  status line) instead of closing immediately: launching keeps running in
+  the background either way, but the loading screen sticks around long
+  enough to catch a fast failure (typo'd attribute, no `mainProgram` guess,
+  no network) and show it as an error instead of just silently vanishing.
+  For an already-cached package it'll flash by quickly; for something being
+  fetched/built for the first time it gives up watching (and closes) after
+  a few seconds, trusting the detached process to keep going on its own.
+  Esc during loading cancels the launch outright. The exact command it's
+  about to run is shown at the bottom of the detail panel before you launch.
 - **Tab** switches between *Packages* search (name + description) and
   *Programs* search (search by the binary a package provides — e.g. typing
   `rg` finds `ripgrep`).
@@ -65,6 +73,10 @@ setsid nix --extra-experimental-features "nix-command flakes" shell \
 the package name), so the right binary gets run even when it doesn't match
 the attribute name — e.g. `google-chrome` → `google-chrome-stable`.
 `setsid` detaches the process so it keeps running after the popup exits.
+stdout/stderr are redirected to a temp file (not a pipe or `/dev/null`) so
+the app can tail it for the loading screen's status line without risking a
+`SIGPIPE` in the launched program if the popup exits while it's still
+writing.
 
 The Elasticsearch index name is versioned
 (`latest-<schema-version>-nixos-<channel>`); `SCHEMA_VERSION` in

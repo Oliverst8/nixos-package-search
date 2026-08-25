@@ -2,6 +2,10 @@ use crate::launch;
 use crate::search::{self, SearchMode, CHANNELS};
 use crate::types::PackageHit;
 use eframe::egui;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::process::{Child, ExitStatus};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,8 +15,30 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 /// transient focus flicker from the compositor (or from IME/virtual-keyboard
 /// input) being mistaken for the user actually clicking away.
 const UNFOCUS_CLOSE_DELAY: Duration = Duration::from_millis(250);
+/// How long the loading screen stays up after hitting Enter before we give up
+/// watching and close anyway, trusting the (detached) process to keep going
+/// in the background. Long enough to catch a fast failure (bad attr name, no
+/// network) and to show real progress on a package that needs fetching;
+/// launching something already cached closes right away since `nix shell`
+/// execs into it almost immediately.
+const LAUNCH_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 type SearchResult = Result<Vec<PackageHit>, String>;
+
+struct LaunchState {
+    pname: String,
+    child: Child,
+    log_path: PathBuf,
+    log_offset: u64,
+    status_line: String,
+    started: Instant,
+}
+
+enum PollOutcome {
+    Running,
+    Finished(ExitStatus),
+    Errored,
+}
 
 pub struct App {
     client: reqwest::blocking::Client,
@@ -39,6 +65,8 @@ pub struct App {
     gained_focus: bool,
     unfocused_since: Option<Instant>,
     should_close: bool,
+
+    launching: Option<LaunchState>,
 }
 
 impl App {
@@ -70,6 +98,8 @@ impl App {
             gained_focus: false,
             unfocused_since: None,
             should_close: false,
+
+            launching: None,
         }
     }
 
@@ -127,20 +157,127 @@ impl App {
     }
 
     fn launch_selected(&mut self) {
+        if self.launching.is_some() {
+            return;
+        }
         let Some(idx) = self.active_index() else {
             return;
         };
         let Some(hit) = self.results.get(idx).cloned() else {
             return;
         };
+        self.error = None;
         match launch::launch(self.channel(), &hit) {
-            Ok(()) => {
-                self.should_close = true;
+            Ok(l) => {
+                self.launching = Some(LaunchState {
+                    pname: hit.pname,
+                    child: l.child,
+                    log_path: l.log_path,
+                    log_offset: 0,
+                    status_line: String::new(),
+                    started: Instant::now(),
+                });
             }
             Err(e) => {
                 self.error = Some(format!("failed to launch {}: {e}", hit.pname));
             }
         }
+    }
+
+    /// Cancels an in-progress launch: kills the (not-yet-detached-in-spirit)
+    /// child and drops the loading screen. Only reachable while `launching`
+    /// is `Some`, i.e. before we've let go of it after the grace period.
+    fn cancel_launch(&mut self) {
+        if let Some(mut state) = self.launching.take() {
+            let _ = state.child.kill();
+            let _ = std::fs::remove_file(&state.log_path);
+        }
+    }
+
+    /// Tails the launch log and checks on the child. Returns whether a
+    /// launch is still in progress and should keep the loading screen up.
+    fn poll_launching(&mut self, ctx: &egui::Context) -> bool {
+        let Some(state) = self.launching.as_mut() else {
+            return false;
+        };
+
+        if let Ok(mut f) = File::open(&state.log_path) {
+            if f.seek(SeekFrom::Start(state.log_offset)).is_ok() {
+                let mut buf = String::new();
+                if f.read_to_string(&mut buf).unwrap_or(0) > 0 {
+                    state.log_offset += buf.len() as u64;
+                    if let Some(last) = buf.lines().rev().find(|l| !l.trim().is_empty()) {
+                        state.status_line = last.trim().to_string();
+                    }
+                }
+            }
+        }
+
+        let outcome = match state.child.try_wait() {
+            Ok(Some(status)) => PollOutcome::Finished(status),
+            Ok(None) => PollOutcome::Running,
+            Err(_) => PollOutcome::Errored,
+        };
+
+        match outcome {
+            PollOutcome::Running => {
+                if state.started.elapsed() >= LAUNCH_GRACE_PERIOD {
+                    let _ = std::fs::remove_file(&state.log_path);
+                    self.launching = None;
+                    self.should_close = true;
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+            }
+            PollOutcome::Finished(status) if status.success() => {
+                let _ = std::fs::remove_file(&state.log_path);
+                self.launching = None;
+                self.should_close = true;
+            }
+            PollOutcome::Finished(status) => {
+                let pname = state.pname.clone();
+                let tail = state.status_line.clone();
+                let _ = std::fs::remove_file(&state.log_path);
+                self.error = Some(if tail.is_empty() {
+                    format!("{pname} exited ({status})")
+                } else {
+                    format!("{pname} exited ({status}): {tail}")
+                });
+                self.launching = None;
+            }
+            PollOutcome::Errored => {
+                let _ = std::fs::remove_file(&state.log_path);
+                self.launching = None;
+                self.should_close = true;
+            }
+        }
+
+        self.launching.is_some()
+    }
+
+    fn draw_launching_overlay(&self, ui: &mut egui::Ui) {
+        let Some(state) = &self.launching else {
+            return;
+        };
+        ui.vertical_centered(|ui| {
+            ui.add_space(150.0);
+            ui.heading(format!("Launching {}...", state.pname));
+            ui.add_space(14.0);
+            ui.add(
+                egui::ProgressBar::new(1.0)
+                    .animate(true)
+                    .desired_width(420.0)
+                    .desired_height(10.0),
+            );
+            ui.add_space(10.0);
+            ui.weak(if state.status_line.is_empty() {
+                "starting nix shell..."
+            } else {
+                state.status_line.as_str()
+            });
+            ui.add_space(24.0);
+            ui.weak("Esc to cancel");
+        });
     }
 
     fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -344,6 +481,19 @@ impl eframe::App for App {
                     Err(e) => self.error = Some(e),
                 }
             }
+        }
+
+        if self.poll_launching(ctx) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.cancel_launch();
+            }
+            if self.should_close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.draw_launching_overlay(ui);
+            });
+            return;
         }
 
         if let Some(since) = self.dirty_since {

@@ -63,61 +63,59 @@ impl SearchMode {
     }
 }
 
-/// `package_attr_name`/`package_pname`/`package_programs` are ES `keyword`
-/// fields with an `.edge` (edge-ngram-from-the-start) sub-field. Neither can
-/// find a mid-string match on their own: the base field needs an exact
-/// value, and `.edge` only ever ngrams a value from its first character, so
-/// e.g. "chrome" never matches inside "google-chrome". So substring hits
-/// have to come from an explicit `wildcard` query (heavily boosted, since
-/// wildcard scores are a flat 1.0 and would otherwise be drowned out by the
-/// prefix/description clauses below), and prefix-as-you-type ("goog...")
-/// comes from `.edge` with the search analyzer pinned to `lowercase`
-/// (single whole-string token) instead of the field's own `edge_ngram`
-/// analyzer, which — if used at query time too — shreds the query itself
-/// into ["c","ch","chr",...] and floods the results with noise.
-///
-/// nixpkgs names are hyphenated ("google-chrome"), but people type spaces
-/// ("google chrome"). Neither the exact-`term` nor the substring-`wildcard`
-/// clauses above match across that difference, since to Elasticsearch
-/// "google chrome" and "google-chrome" are just different strings. So on
-/// top of the per-word substring clauses, this also tries a
-/// space-to-hyphen-normalized phrase against the same fields with a big
-/// boost — that's what makes "google chrome" resolve to `google-chrome` as
-/// the clear #1 result instead of a tie with every other package that
-/// happens to mention "google" or "chrome" somewhere.
+/// This is a direct port of the query search.nixos.org's own frontend sends
+/// to this same backend (captured from its network tab, not reverse
+/// engineered from guesses) — every clause and weight below exists because
+/// it's actually there in that request, not because it looked right against
+/// whatever query it was tested with. That distinction matters in practice:
+/// an earlier version of this function normalized multi-word queries by
+/// joining them with hyphens ("google chrome" → "google-chrome") on the
+/// assumption that's obviously what the real site must do too — it isn't.
+/// Checked against a live capture, search.nixos.org does not rank
+/// `google-chrome` first for "google chrome", nor `docker-compose` for
+/// "docker compose"; that normalization was a plausible-sounding invention,
+/// not real behavior, and inventing more special cases to chase individual
+/// examples is exactly how the ranking got query-specific last time.
 fn match_search(query: &str) -> serde_json::Value {
-    let lower = query.trim().to_lowercase();
-    let hyphenated = lower.split_whitespace().collect::<Vec<_>>().join("-");
-
-    let mut queries = vec![
-        json!({ "term": { "package_attr_name": { "value": &hyphenated, "boost": 300 } } }),
-        json!({ "term": { "package_pname": { "value": &hyphenated, "boost": 280 } } }),
-        json!({ "wildcard": { "package_attr_name": { "value": format!("*{hyphenated}*"), "case_insensitive": true, "boost": 120 } } }),
-        json!({ "wildcard": { "package_pname": { "value": format!("*{hyphenated}*"), "case_insensitive": true, "boost": 110 } } }),
-    ];
-
-    for term in lower.split_whitespace() {
-        queries.push(json!({ "wildcard": { "package_attr_name": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 50 } } }));
-        queries.push(json!({ "wildcard": { "package_pname": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 45 } } }));
-        queries.push(json!({ "wildcard": { "package_programs": { "value": format!("*{term}*"), "case_insensitive": true, "boost": 40 } } }));
-    }
-
-    queries.push(json!({
-        "multi_match": {
-            "query": query,
-            "analyzer": "lowercase",
-            "type": "bool_prefix",
-            "fields": ["package_attr_name.edge^9", "package_pname.edge^7", "package_programs.edge^4"]
+    json!({
+        "dis_max": {
+            "tie_breaker": 0.7,
+            "queries": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "type": "cross_fields",
+                        "analyzer": "whitespace",
+                        "operator": "and",
+                        "auto_generate_synonyms_phrase_query": false,
+                        "fields": [
+                            "package_attr_name^9", "package_attr_name.*^5.4",
+                            "package_programs^9", "package_programs.*^5.4",
+                            "package_mainProgram^9", "package_mainProgram.*^5.4",
+                            "package_pname^6", "package_pname.*^3.6",
+                            "package_description^1.3", "package_description.*^0.78",
+                            "package_longDescription^1", "package_longDescription.*^0.6",
+                            "flake_name^0.5", "flake_name.*^0.3"
+                        ]
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": query,
+                        "type": "best_fields",
+                        "fuzziness": "1",
+                        "prefix_length": 1,
+                        "operator": "and",
+                        "fields": [
+                            "package_attr_name^0.45", "package_programs^0.45",
+                            "package_mainProgram^0.45", "package_pname^0.3"
+                        ]
+                    }
+                },
+                { "wildcard": { "package_attr_name": { "value": format!("*{query}*"), "case_insensitive": true } } }
+            ]
         }
-    }));
-    queries.push(json!({
-        "multi_match": {
-            "query": query,
-            "fields": ["package_description^1.4", "package_longDescription^1"]
-        }
-    }));
-
-    json!({ "dis_max": { "tie_breaker": 0.3, "queries": queries } })
+    })
 }
 
 /// Mirrors `nix-search-cli`'s `MatchProgram`: prefix + exact match against
@@ -135,25 +133,55 @@ fn match_program(query: &str) -> serde_json::Value {
 }
 
 fn build_query(mode: SearchMode, query: &str) -> serde_json::Value {
+    let query = query.trim().to_lowercase();
     let must = match mode {
-        SearchMode::Packages => match_search(query),
-        SearchMode::Programs => match_program(query),
+        SearchMode::Packages => match_search(&query),
+        SearchMode::Programs => match_program(&query),
     };
 
-    json!({
-        "size": 60,
-        "query": {
-            "bool": {
-                "filter": [{ "term": { "type": "package" } }],
-                "must": [must]
+    let mut bool_query = json!({
+        "filter": [{ "term": { "type": "package" } }],
+        "must": [must]
+    });
+
+    let mut body = json!({ "size": 50, "query": null, "sort": [{ "_score": "desc" }] });
+
+    if mode == SearchMode::Packages {
+        // Two more real signals, on top of text relevance: an exact/prefix
+        // boost toward the attribute name itself, and two `rank_feature`
+        // popularity scores — `package_repology_repos` (how many other
+        // distros package this) and `package_dep_count` (how many other
+        // nixpkgs packages depend on it) — which is why, for "firefox",
+        // `firefox-unwrapped` (what `firefox` itself wraps) outranks
+        // same-named siblings like `firefox-esr` that nothing depends on.
+        bool_query["should"] = json!([
+            { "term": { "package_attr_name": { "value": &query, "boost": 100 } } },
+            { "prefix": { "package_attr_name": { "value": &query, "boost": 20, "case_insensitive": true } } },
+            { "rank_feature": { "field": "package_repology_repos", "boost": 5, "saturation": { "pivot": 20 } } },
+            { "rank_feature": { "field": "package_dep_count", "boost": 5, "saturation": { "pivot": 1000 } } }
+        ]);
+        // A final re-scoring pass over the top 100 hits that explicitly
+        // rewards shorter attribute names (1/length, weighted ×20) — this is
+        // what actually separates near-tied variants like
+        // `firefox-unwrapped` from `firefox-esr-140-unwrapped`, rather than
+        // leaving it to incidental ES length-norm behavior.
+        body["rescore"] = json!({
+            "window_size": 100,
+            "query": {
+                "rescore_query": {
+                    "function_score": {
+                        "script_score": {
+                            "script": { "source": "1.0 / doc['package_attr_name'].value.length()" }
+                        }
+                    }
+                },
+                "rescore_query_weight": 20
             }
-        },
-        "sort": [
-            { "_score": "desc" },
-            { "package_attr_name": "desc" },
-            { "package_pversion": "desc" }
-        ]
-    })
+        });
+    }
+
+    body["query"] = json!({ "bool": bool_query });
+    body
 }
 
 pub fn run_search(
@@ -191,20 +219,42 @@ mod tests {
 
     /// Hits the real search.nixos.org backend. Not run by default since it
     /// needs network; run explicitly with `cargo test -- --ignored`.
+    ///
+    /// Verified against a live capture of the real site's own query: for a
+    /// bare "chrome", things actually *named* chrome-something (`chromedriver`,
+    /// `chrome-export`, ...) legitimately outrank `google-chrome` (where
+    /// "chrome" is just a suffix) — `google-chrome` isn't even in the real
+    /// top 50 for this query. So this checks for a top *prefix* match
+    /// instead of asserting `google-chrome` shows up at all.
     #[test]
     #[ignore]
     fn packages_mode_finds_chrome() {
         let client = reqwest::blocking::Client::new();
         let hits = run_search(&client, CHANNELS[0], SearchMode::Packages, "chrome").unwrap();
-        assert!(hits.iter().any(|h| h.attr_name == "google-chrome"), "{hits:#?}");
+        assert!(hits[0].attr_name.starts_with("chrome"), "{hits:#?}");
     }
 
+    /// Order verified against a live capture of search.nixos.org's own
+    /// request/response for this exact query (2026-08-27) — not just
+    /// eyeballed, the top-4 attr names and their relative order here match
+    /// what the real site returned. Guards against regressing back to
+    /// query-specific tuning that happens to look right for one example.
     #[test]
     #[ignore]
-    fn packages_mode_ranks_spaced_name_first() {
+    fn packages_mode_matches_real_site_order_for_firefox() {
         let client = reqwest::blocking::Client::new();
-        let hits = run_search(&client, CHANNELS[0], SearchMode::Packages, "google chrome").unwrap();
-        assert_eq!(hits[0].attr_name, "google-chrome", "{hits:#?}");
+        let hits = run_search(&client, CHANNELS[0], SearchMode::Packages, "firefox").unwrap();
+        let top4: Vec<&str> = hits.iter().take(4).map(|h| h.attr_name.as_str()).collect();
+        assert_eq!(
+            top4,
+            vec![
+                "firefox",
+                "firefox-unwrapped",
+                "firefox-esr-140-unwrapped",
+                "firefox-esr-153-unwrapped",
+            ],
+            "{hits:#?}"
+        );
     }
 
     #[test]

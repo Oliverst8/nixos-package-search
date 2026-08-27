@@ -61,7 +61,6 @@ pub struct App {
     status: Option<String>,
     error: Option<String>,
 
-    focused_once: bool,
     gained_focus: bool,
     unfocused_since: Option<Instant>,
     should_close: bool,
@@ -94,7 +93,6 @@ impl App {
             rx,
             status: None,
             error: None,
-            focused_once: false,
             gained_focus: false,
             unfocused_since: None,
             should_close: false,
@@ -281,25 +279,61 @@ impl App {
     }
 
     fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("🔍").size(18.0));
-            let edit = egui::TextEdit::singleline(&mut self.query)
-                .hint_text("search nixpkgs...")
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Heading);
-            let resp = ui.add(edit);
+        let available_width = ui.available_width();
+        let search_frame = egui::Frame::default()
+            .fill(ui.visuals().extreme_bg_color)
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::symmetric(16, 12));
 
-            if !self.focused_once {
-                resp.request_focus();
-                self.focused_once = true;
-            }
-            if resp.changed() {
-                self.mark_dirty();
-            }
+        search_frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🔍")
+                        .size(20.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(8.0);
+                let edit = egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Search nixpkgs...")
+                    .desired_width(f32::INFINITY)
+                    .font(egui::FontId::proportional(22.0))
+                    .frame(egui::Frame::NONE);
+                let resp = ui.add(edit);
+
+                // Keep the field focused at all times (like Spotlight/Alfred)
+                // so typing is never interrupted by results appearing or the
+                // mouse drifting over a row — arrow-key list navigation
+                // already works independently via global key polling below,
+                // it doesn't need to steal focus to do its job.
+                if !resp.has_focus() {
+                    resp.request_focus();
+                }
+                if resp.changed() {
+                    self.mark_dirty();
+                }
+
+                if !self.query.is_empty()
+                    && ui
+                        .add(egui::Button::new(egui::RichText::new("✕").weak()).frame(false))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                {
+                    self.query.clear();
+                    self.mark_dirty();
+                }
+            });
         });
 
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
+            // A plain (non-wrapping) `horizontal` layout doesn't cap itself
+            // to the panel's real width — nesting a `right_to_left` region
+            // in it (for the result count below) then right-aligns against
+            // that uncapped width instead of the actual visible edge, and
+            // the count runs under the detail panel. Pin it to the width we
+            // know is correct, measured before any of this row's own
+            // content could throw it off.
+            ui.set_max_width(available_width);
             for mode in [SearchMode::Packages, SearchMode::Programs] {
                 if ui
                     .selectable_label(self.mode == mode, mode.label())
@@ -326,14 +360,26 @@ impl App {
                 if self.in_flight {
                     ui.spinner();
                 } else {
-                    ui.label(format!("{} results", self.results.len()));
+                    ui.add(
+                        egui::Label::new(format!("{} results", self.results.len())).truncate(),
+                    );
                 }
             });
         });
     }
 
     fn draw_results_list(&mut self, ui: &mut egui::Ui) {
+        // A `ScrollArea` with only vertical scrolling enabled still sizes
+        // its own width to whatever its content wants ("expand to fit"),
+        // rather than clipping content to the space actually available —
+        // so a single too-wide child can silently balloon the whole column
+        // out past the results list and under the (always-visible) detail
+        // panel next to it. Measuring the width *before* entering the
+        // scroll area, then hard-capping to it inside, keeps every row
+        // confined to the real available space no matter what it contains.
+        let available_width = ui.available_width();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(available_width);
             if self.results.is_empty() {
                 ui.add_space(12.0);
                 let msg = if self.query.trim().is_empty() {
@@ -347,20 +393,84 @@ impl App {
                 return;
             }
 
+            let mut any_hovered = false;
+
             for idx in 0..self.results.len() {
                 let is_selected = idx == self.selected;
+                let is_hovered = self.hovered == Some(idx);
                 let hit = &self.results[idx];
-                let mut label = egui::RichText::new(&hit.pname).strong();
-                if is_selected {
-                    label = label.color(ui.visuals().selection.stroke.color);
-                }
 
-                let row = ui.horizontal(|ui| {
+                let bg = if is_selected {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.55)
+                } else if is_hovered {
+                    elevated(ui.visuals(), ui.visuals().panel_fill, 16)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+
+                let row_frame = egui::Frame::default()
+                    .fill(bg)
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+
+                let row = row_frame.show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.vertical(|ui| {
-                        ui.label(label);
+                        // Title is the nixpkgs attribute name (e.g.
+                        // "firefox-esr-140-unwrapped"), same as
+                        // search.nixos.org's result cards — not the pname,
+                        // which is often shared by several attrs.
+                        let mut title = egui::RichText::new(&hit.attr_name).size(16.0);
+                        title = title.color(if is_selected {
+                            ui.visuals().selection.stroke.color
+                        } else {
+                            ui.visuals().hyperlink_color
+                        });
+                        // `.truncate()` clips to however many pixels are
+                        // actually available (ellipsis, single line) instead
+                        // of wrapping — needed because a long attr name is
+                        // one unbroken token with no space to wrap at, so
+                        // without this it would just overflow past the row
+                        // uncontained, same as the untruncated grid values
+                        // did in the detail panel (see MAX_VALUE below).
+                        ui.add(egui::Label::new(title).truncate());
+
                         if let Some(desc) = &hit.description {
-                            ui.weak(truncate(desc, 60));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(desc).size(13.0)).truncate(),
+                            );
+                        }
+
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.weak("Name:");
+                            code_pill(ui, &hit.pname);
+                            ui.weak("Version:");
+                            code_pill(ui, if hit.version.is_empty() {
+                                "-"
+                            } else {
+                                &hit.version
+                            });
+                            if !hit.outputs.is_empty() {
+                                ui.weak("Outputs:");
+                                for o in &hit.outputs {
+                                    code_pill(ui, o);
+                                }
+                            }
+                            if let Some(home) = hit.homepage.first() {
+                                ui.hyperlink_to("🌐 Homepage", home);
+                            }
+                        });
+
+                        if !hit.licenses.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.weak("License:");
+                                for l in &hit.licenses {
+                                    code_pill(ui, l);
+                                }
+                            });
                         }
                     });
                 });
@@ -370,6 +480,7 @@ impl App {
 
                 if resp.hovered() {
                     self.hovered = Some(idx);
+                    any_hovered = true;
                 }
                 if resp.clicked() {
                     self.selected = idx;
@@ -382,15 +493,13 @@ impl App {
                 if is_selected && self.move_selection_into_view {
                     resp.scroll_to_me(Some(egui::Align::Center));
                 }
-                if is_selected {
-                    ui.painter().rect_stroke(
-                        resp.rect,
-                        4.0,
-                        egui::Stroke::new(1.0, ui.visuals().selection.bg_fill),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(4.0);
+            }
+            if !any_hovered {
+                self.hovered = None;
             }
             self.move_selection_into_view = false;
         });
@@ -414,8 +523,19 @@ impl App {
         }
         if let Some(long) = hit.long_description.as_ref().filter(|s| !s.is_empty()) {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(long).weak());
+            ui.label(egui::RichText::new(strip_html_tags(long)).weak());
         }
+
+        // Grid columns auto-size to the widest value ever shown in them and
+        // never shrink back down (state is cached across frames/selections
+        // by the grid's id), and this panel's `ScrollArea` expands to fit
+        // whatever width its content wants since only vertical scrolling is
+        // enabled. Together, one long value (a source path, a long
+        // maintainer list) would balloon the column — and therefore the
+        // whole scroll area — well past the panel, visibly shifting/clipping
+        // everything else in it. Truncating free-text values keeps the grid
+        // (and the panel) at a sane, predictable width.
+        const MAX_VALUE: usize = 42;
 
         ui.add_space(10.0);
         egui::Grid::new("detail_grid")
@@ -429,27 +549,32 @@ impl App {
                 }
                 if !hit.licenses.is_empty() {
                     ui.label("license");
-                    ui.label(hit.licenses.join(", "));
+                    ui.label(truncate(&hit.licenses.join(", "), MAX_VALUE));
+                    ui.end_row();
+                }
+                if !hit.outputs.is_empty() {
+                    ui.label("outputs");
+                    ui.label(truncate(&hit.outputs.join(", "), MAX_VALUE));
                     ui.end_row();
                 }
                 if !hit.maintainers.is_empty() {
                     ui.label("maintainers");
-                    ui.label(hit.maintainers.join(", "));
+                    ui.label(truncate(&hit.maintainers.join(", "), MAX_VALUE));
                     ui.end_row();
                 }
                 if !hit.homepage.is_empty() {
                     ui.label("homepage");
-                    ui.label(hit.homepage.join(", "));
+                    ui.label(truncate(&hit.homepage.join(", "), MAX_VALUE));
                     ui.end_row();
                 }
                 if !hit.programs.is_empty() {
                     ui.label("provides");
-                    ui.label(hit.programs.join(", "));
+                    ui.label(truncate(&hit.programs.join(", "), MAX_VALUE));
                     ui.end_row();
                 }
                 if let Some(pos) = &hit.position {
                     ui.label("defined at");
-                    ui.label(pos);
+                    ui.label(truncate(pos, MAX_VALUE));
                     ui.end_row();
                 }
                 ui.label("platforms");
@@ -461,7 +586,14 @@ impl App {
         ui.separator();
         ui.add_space(6.0);
         ui.label("will run:");
-        ui.code(launch::command_preview(self.channel(), &hit));
+        // Same overflow hazard as the grid above: this is one long line, so
+        // wrap it token-by-token instead of handing a single wide Label to
+        // the scroll area.
+        ui.horizontal_wrapped(|ui| {
+            for token in launch::command_preview(self.channel(), &hit).split(' ') {
+                ui.code(token);
+            }
+        });
     }
 }
 
@@ -550,12 +682,27 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        egui::Panel::top("top_bar")
+        // Detail card sits permanently on the right (showing a placeholder
+        // until something is hovered/selected) rather than appearing and
+        // disappearing. It's an *additional* panel, not a replacement for
+        // the results column — the window is sized wide enough (see
+        // main.rs) that it never squeezes the results list — and keeping it
+        // always present means the results column's width never changes, so
+        // nothing reflows or gets covered when you hover a result.
+        let detail_frame = egui::Frame::default()
+            .fill(elevated(ui.visuals(), ui.visuals().panel_fill, 9))
+            .inner_margin(egui::Margin::symmetric(18, 16));
+        egui::Panel::right("detail_panel")
+            .resizable(false)
+            .exact_size(380.0)
             .show_separator_line(true)
+            .frame(detail_frame)
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                self.draw_top_bar(ui);
-                ui.add_space(6.0);
+                let available_width = ui.available_width();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_max_width(available_width);
+                    self.draw_detail_panel(ui);
+                });
             });
 
         if let Some(err) = self.error.clone() {
@@ -569,23 +716,81 @@ impl eframe::App for App {
             });
         }
 
-        egui::Panel::left("results_panel")
-            .resizable(true)
-            .default_size(300.0)
-            .size_range(220.0..=460.0)
-            .show(ui, |ui| {
-                self.draw_results_list(ui);
-            });
-
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.draw_detail_panel(ui);
-            });
+            ui.add_space(6.0);
+            self.draw_top_bar(ui);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            self.draw_results_list(ui);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.weak("Enter launch · Tab mode · Ctrl+Tab channel · Esc close");
             });
         });
     }
+}
+
+/// A panel-fill color nudged lighter (dark mode) or darker (light mode), for
+/// opaque "elevated surface" panels/highlights. `visuals().faint_bg_color` is
+/// alpha-0 additive-blend-only and turns invisible/see-through on a plain
+/// `Frame` fill, so card and hover backgrounds use this instead.
+fn elevated(visuals: &egui::Visuals, base: egui::Color32, delta: u8) -> egui::Color32 {
+    let adj = |c: u8| -> u8 {
+        if visuals.dark_mode {
+            c.saturating_add(delta)
+        } else {
+            c.saturating_sub(delta)
+        }
+    };
+    egui::Color32::from_rgb(adj(base.r()), adj(base.g()), adj(base.b()))
+}
+
+/// A `ui.code(text)` pill that truncates (ellipsis) instead of overflowing.
+/// `horizontal_wrapped` only wraps *between* widgets — a single value long
+/// enough to exceed the row's own width on its own (an unusually long
+/// `pname`, license string, or output name) has nothing to wrap onto its own
+/// line for, and would otherwise run past the results column, under the
+/// always-visible detail panel next to it.
+fn code_pill(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(text).code()).truncate());
+}
+
+/// Some packages' `longDescription` is raw HTML (nixpkgs source markup like
+/// `<rendered-html><p>...</p></rendered-html>`) rather than plain text — this
+/// strips tags and decodes the handful of entities that show up in practice,
+/// so the detail panel doesn't display literal `<p>`/`</rendered-html>` tags.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut tag = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' => {
+                in_tag = false;
+                let tag = tag.to_ascii_lowercase();
+                if tag.starts_with("/p") || tag.starts_with("br") {
+                    out.push('\n');
+                }
+            }
+            _ if in_tag => tag.push(c),
+            _ => out.push(c),
+        }
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate(s: &str, max: usize) -> String {

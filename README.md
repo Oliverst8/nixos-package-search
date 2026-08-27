@@ -90,17 +90,23 @@ page source for the current `elasticsearchMappingSchemaVersion`.
 
 ### A note on search ranking
 
-`package_attr_name`/`package_pname` are indexed as ES `keyword` fields with
-an edge-ngram sub-field, which is great for prefix search ("goog..." →
-`google-chrome`) but structurally can't match a term in the *middle* of a
-value ("chrome" alone won't ngram-match `google-chrome`, since the ngrams
-only grow from the start of the string). `src/search.rs` adds explicit
-heavily-boosted `wildcard` substring queries to cover that case, on top of
-the prefix/exact/description matching. See the comments in `match_search`
-for the full story, including why the query pins `"analyzer": "lowercase"`
-on the prefix clause (without it, the field's own `edge_ngram` analyzer gets
-reused to tokenize the *query* too, which shreds a word like "chrome" into
-`ch`/`chr`/`chro`/... and floods results with noise).
+`src/search.rs`'s query is a direct port of the query search.nixos.org's own
+frontend sends this same backend (captured from its network tab), not a
+guessed-at reconstruction: a `cross_fields` match across attr name/programs/
+pname/description weighted the same way the real site weights them, a fuzzy
+pass for typo tolerance, a substring `wildcard` for mid-string hits ("chrome"
+inside `google-chrome`), `package_repology_repos`/`package_dep_count` as
+`rank_feature` popularity signals, and a final rescore pass that explicitly
+rewards shorter attribute names. See the comments in `match_search` and
+`build_query` for the full breakdown of each clause.
+
+Notably, the real site does *not* normalize multi-word queries into
+nixpkgs' hyphenated naming — searching "google chrome" does not rank
+`google-chrome` first there, nor "docker compose" → `docker-compose`; an
+earlier version of this query invented that normalization on the (wrong)
+assumption it was obviously how the real site must behave. Matching the
+*real* query, including its quirks, generalizes far better across arbitrary
+searches than tuning boost numbers against a handful of examples does.
 
 ## Hyprland integration
 
@@ -111,7 +117,7 @@ needs a couple of Hyprland rules in your config:
 ```ini
 windowrulev2 = float, class:^(nixos-package-search)$
 windowrulev2 = center, class:^(nixos-package-search)$
-windowrulev2 = size 780 480, class:^(nixos-package-search)$
+windowrulev2 = size 1100 620, class:^(nixos-package-search)$
 windowrulev2 = stayfocused, class:^(nixos-package-search)$
 
 bind = $mod, D, exec, nix run --refresh /path/to/nixos-package-search

@@ -8,6 +8,8 @@ pub struct PackageHit {
     pub pname: String,
     #[serde(rename = "package_pversion", default)]
     pub version: String,
+    #[serde(rename = "package_outputs", default)]
+    pub outputs: Vec<String>,
     #[serde(rename = "package_description", default)]
     pub description: Option<String>,
     #[serde(rename = "package_longDescription", default)]

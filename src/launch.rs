@@ -35,8 +35,14 @@ pub fn command_preview(hit: &PackageHit) -> String {
 /// The equivalent preview for terminal mode, or `None` when no terminal
 /// emulator could be found (in which case the UI says so instead of
 /// offering a command that can't run).
-pub fn terminal_command_preview(hit: &PackageHit) -> Option<String> {
+pub fn terminal_command_preview(hit: &PackageHit, autorun: bool) -> Option<String> {
     let term = find_terminal()?;
+    let shell = terminal_shell();
+    let inner = if autorun {
+        format!("{}; exec {shell}", hit.runnable())
+    } else {
+        format!("exec {shell}")
+    };
     let mut parts = vec![term.display_name()];
     parts.extend(term.exec_prefix.iter().map(|a| a.to_string()));
     parts.extend([
@@ -44,7 +50,7 @@ pub fn terminal_command_preview(hit: &PackageHit) -> Option<String> {
         "-p".to_string(),
         hit.attr_name.clone(),
         "--run".to_string(),
-        format!("\"exec {}\"", terminal_shell()),
+        format!("\"{inner}\""),
     ]);
     Some(parts.join(" "))
 }
@@ -88,11 +94,17 @@ pub fn launch(hit: &PackageHit) -> io::Result<Launching> {
 /// (and its `--help`, its subcommands, repeated invocations) rather than one
 /// fire-and-forget run of a single binary.
 ///
+/// With `autorun`, the package's own program runs first and the prompt is
+/// what you're left with when it exits — so `htop` starts straight away, and
+/// quitting it drops you into the shell it was running in rather than
+/// closing the window. That's the difference between the two terminal
+/// bindings: both end at a prompt, one of them has already run the thing.
+///
 /// Detached like [`launch`], so the terminal outlives the popup. Nothing is
 /// tailed here: the terminal is already showing nix's output, and the script
 /// below keeps a failed launch on screen instead of letting the window blink
 /// out of existence with the error in it.
-pub fn launch_in_terminal(hit: &PackageHit) -> io::Result<Child> {
+pub fn launch_in_terminal(hit: &PackageHit, autorun: bool) -> io::Result<Child> {
     let term = find_terminal().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -110,6 +122,12 @@ pub fn launch_in_terminal(hit: &PackageHit) -> io::Result<Child> {
         .args(["/bin/sh", "-c", TERMINAL_SCRIPT, "nixos-package-search"])
         .arg(&hit.attr_name)
         .arg(sh_quote(&terminal_shell()))
+        // `$3`: the program to run on the way in, empty for a bare prompt.
+        .arg(if autorun {
+            sh_quote(&hit.runnable())
+        } else {
+            String::new()
+        })
         .env(UNFREE.0, UNFREE.1)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -125,9 +143,10 @@ pub fn launch_in_terminal(hit: &PackageHit) -> io::Result<Child> {
     cmd.spawn()
 }
 
-/// Run inside the spawned terminal, with the nixpkgs attribute as `$1` and
-/// the shell to land in as `$2` (already shell-quoted by [`terminal_shell`],
-/// so `--run` can interpolate it directly).
+/// Run inside the spawned terminal, with the nixpkgs attribute as `$1`, the
+/// shell to land in as `$2`, and optionally a program to run first as `$3`.
+/// `$2` and `$3` are already shell-quoted, so `--run` can interpolate them
+/// straight into the command it hands to bash.
 ///
 /// The build/fetch is done by an explicit `--run true` pass first, rather
 /// than just dropping straight into `nix-shell -p "$1"`: that way a failure
@@ -144,6 +163,9 @@ nix-shell -p "$1" --run true || {
     read -r _
     exit "$st"
 }
+if [ -n "$3" ]; then
+    exec nix-shell -p "$1" --run "$3; exec $2"
+fi
 exec nix-shell -p "$1" --run "exec $2"
 "#;
 

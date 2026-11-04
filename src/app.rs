@@ -15,6 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// What a press of Enter means, given the modifiers held with it.
+#[derive(Clone, Copy)]
+enum EnterAction {
+    /// Run the package's main program, detached, with no terminal.
+    Run,
+    /// Open a terminal sitting at a prompt inside the package's shell.
+    Terminal,
+    /// Both: a terminal with the program already running in it.
+    TerminalRun,
+}
+
 /// How many icons are fetched at once. Enough to hide the latency of a
 /// screenful, few enough to stay polite to search.nixos.org.
 const ICON_WORKERS: usize = 4;
@@ -417,7 +428,7 @@ impl App {
     /// screen to keep around — the terminal window is itself the progress
     /// display, and it reports its own failures (see `launch::launch_in_terminal`)
     /// — so the popup gets out of the way immediately.
-    fn open_terminal_selected(&mut self) {
+    fn open_terminal_selected(&mut self, autorun: bool) {
         if self.launching.is_some() {
             return;
         }
@@ -428,9 +439,14 @@ impl App {
             return;
         };
         self.error = None;
-        match launch::launch_in_terminal(&hit) {
+        match launch::launch_in_terminal(&hit, autorun) {
             Ok(_) => {
-                history::record(&mut self.history, &hit, LaunchMode::Terminal);
+                let mode = if autorun {
+                    LaunchMode::TerminalRun
+                } else {
+                    LaunchMode::Terminal
+                };
+                history::record(&mut self.history, &hit, mode);
                 self.should_close = true;
             }
             Err(e) => {
@@ -822,12 +838,14 @@ impl App {
         // Which terminal (if any) we'd use is a `$PATH` lookup, so resolve
         // it once per frame up here rather than inside the button and the
         // preview separately.
-        let terminal_cmd = launch::terminal_command_preview(&hit);
+        let terminal_cmd = launch::terminal_command_preview(&hit, false);
+        let terminal_run_cmd = launch::terminal_command_preview(&hit, true);
         // The buttons below are drawn while `ui` holds a borrow of `self`'s
         // drawing closure; acting on them is deferred to the end of the
         // function, where calling back into `&mut self` is free of it.
         let mut run_clicked = false;
         let mut terminal_clicked = false;
+        let mut terminal_run_clicked = false;
 
         ui.heading(&hit.pname);
         ui.label(format!("{}  ·  v{}", hit.attr_name, hit.version));
@@ -901,7 +919,8 @@ impl App {
         ui.separator();
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
+        // Wrapped: three buttons don't fit the panel's width on one line.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("▶  Run")
                 .on_hover_text("Enter — run the package's main program")
@@ -915,6 +934,16 @@ impl App {
                 .clicked()
             {
                 terminal_clicked = true;
+            }
+            if ui
+                .add_enabled(
+                    terminal_run_cmd.is_some(),
+                    egui::Button::new("⌨▶  Terminal + run"),
+                )
+                .on_hover_text("Ctrl+Alt+Enter — a terminal with the program already running in it")
+                .clicked()
+            {
+                terminal_run_clicked = true;
             }
         });
 
@@ -937,11 +966,20 @@ impl App {
             }
         }
 
+        if let Some(cmd) = &terminal_run_cmd {
+            ui.add_space(6.0);
+            ui.weak("Ctrl+Alt+Enter opens:");
+            command_preview(ui, cmd);
+        }
+
         if run_clicked {
             self.launch_selected();
         }
         if terminal_clicked {
-            self.open_terminal_selected();
+            self.open_terminal_selected(false);
+        }
+        if terminal_run_clicked {
+            self.open_terminal_selected(true);
         }
     }
 }
@@ -1018,17 +1056,25 @@ impl eframe::App for App {
                 self.move_selection_into_view = true;
             }
         });
-        // Ctrl+Enter (or Shift+Enter) opens the package in a terminal instead
-        // of running its main program — same hit, different thing to do with
-        // it. Checked together so a modified Enter doesn't also trigger the
-        // plain one, for the same reason as Ctrl+Tab above.
+        // Three things to do with the same hit, picked by modifier: run its
+        // program, open a terminal in its shell, or both — the terminal with
+        // the program already running in it. Resolved in one place so a
+        // modified Enter never also triggers an unmodified one, for the same
+        // reason as Ctrl+Tab above.
         let enter = ctx.input(|i| {
-            i.key_pressed(egui::Key::Enter)
-                .then(|| i.modifiers.ctrl || i.modifiers.shift)
+            i.key_pressed(egui::Key::Enter).then(|| {
+                let terminal = i.modifiers.ctrl || i.modifiers.shift;
+                match (terminal, i.modifiers.alt) {
+                    (true, true) => EnterAction::TerminalRun,
+                    (true, false) => EnterAction::Terminal,
+                    (false, _) => EnterAction::Run,
+                }
+            })
         });
         match enter {
-            Some(true) => self.open_terminal_selected(),
-            Some(false) => self.launch_selected(),
+            Some(EnterAction::Run) => self.launch_selected(),
+            Some(EnterAction::Terminal) => self.open_terminal_selected(false),
+            Some(EnterAction::TerminalRun) => self.open_terminal_selected(true),
             None => {}
         }
 
@@ -1092,7 +1138,8 @@ impl eframe::App for App {
             self.draw_results_list(ui);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.weak(
-                    "Enter launch · Ctrl+Enter terminal · Tab mode · Ctrl+Tab channel · Esc close",
+                    "Enter run · Ctrl+Enter terminal · Ctrl+Alt+Enter terminal+run · \
+                     Tab mode · Ctrl+Tab channel · Esc close",
                 );
             });
         });

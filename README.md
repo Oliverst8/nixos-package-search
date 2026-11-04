@@ -18,6 +18,9 @@ does the equivalent of:
     ghostty -e nix-shell -p ripgrep \
       --run "exec zsh"                           # Ctrl+Enter
 
+    ghostty -e nix-shell -p htop \
+      --run "htop; exec zsh"                     # Ctrl+Alt+Enter
+
 for whatever you selected, spawned detached so it survives the popup closing.
 ```
 
@@ -37,8 +40,9 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
 
 - **It opens on your launch history** — the packages you last ran, newest
   first, drawn as the same rows a search draws, each with its application
-  icon and a pill saying whether it was last launched normally (`▶ run`) or
-  in a terminal (`⌨ terminal`). That's only a record of what you did last time, not a
+  icon and a pill saying whether it was last launched normally (`▶ run`),
+  in a terminal (`⌨ terminal`), or in a terminal with the program already
+  running (`⌨▶ terminal run`). That's only a record of what you did last time, not a
   constraint: Enter and Ctrl+Enter both work on a history row exactly as
   they do on a search result. Clearing the search box brings the list back.
   History isn't searchable — typing searches nixpkgs, as it always did.
@@ -69,6 +73,14 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
   terminal itself is showing you nix's output; the popup just gets out of
   the way. If the launch fails, the terminal stays open with the error on
   screen rather than blinking out of existence.
+
+- **Ctrl+Alt+Enter** is the same terminal, with the package's program
+  already running in it — `htop` starts straight away instead of leaving you
+  to type it. When the program exits you're left at the prompt *inside* that
+  same `nix-shell`, not with a window that vanishes: quitting `htop` drops
+  you into zsh with `htop` still on `$PATH`, so you can run it again, or run
+  anything else the package ships. The difference between the two terminal
+  bindings is just whether it has already run the thing.
 
   Which terminal gets used: `$TERMINAL` if you've set it, otherwise the
   first one actually installed out of ghostty, kitty, foot, alacritty,
@@ -103,15 +115,17 @@ NIXPKGS_ALLOW_UNFREE=1 setsid nix-shell -p <attr> --run "exec <mainProgram>"
 and terminal mode runs, detached the same way:
 
 ```sh
-<terminal> -e /bin/sh -c '<script>' nixos-package-search <attr> <shell>
+<terminal> -e /bin/sh -c '<script>' nixos-package-search <attr> <shell> [<program>]
 ```
 
 where `<script>` does `nix-shell -p "$1" --run true` first and only then
-`exec nix-shell -p "$1" --run "exec $2"`. Entering the package environment
-via `--run "exec zsh"` is what gets you a zsh instead of the bash
-`nix-shell` would otherwise drop you in — same environment, different
-shell, and `exec` so no bash is left sitting underneath it. The first pass
-is what does the fetching/building,
+`exec nix-shell -p "$1" --run "exec $2"` — or, when a program is passed,
+`--run "$3; exec $2"`, which is the whole of the Ctrl+Alt+Enter difference:
+the program runs first and the shell is what's left when it exits. Entering
+the package environment via `--run "exec zsh"` is what gets you a zsh
+instead of the bash `nix-shell` would otherwise drop you in — same
+environment, different shell, and `exec` so no bash is left sitting
+underneath it. The first pass is what does the fetching/building,
 so a failure there (unknown attribute, no network, a build error) is
 something the script can *see* and pause on — otherwise the terminal window
 would vanish a fraction of a second after appearing, taking the error with

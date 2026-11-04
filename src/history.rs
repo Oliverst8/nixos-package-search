@@ -8,15 +8,21 @@ use std::path::PathBuf;
 /// an archive — a screenful or two is the useful size.
 const MAX_ENTRIES: usize = 50;
 
-/// Which of the two ways a package was launched. Recorded per entry so the
+/// Which of the three ways a package was launched. Recorded per entry so the
 /// history list can show how you ran something last time; it does *not*
-/// constrain how you run it again — Enter and Ctrl+Enter both still work on
-/// a history row, same as on a search result.
+/// constrain how you run it again — every binding still works on a history
+/// row, same as on a search result.
+///
+/// `rename_all` keeps these as plain lowercase words in the file; an entry
+/// written before a variant existed still reads back, since an unknown one
+/// just fails that entry's parse and an unparseable file means an empty
+/// history rather than an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LaunchMode {
     Run,
     Terminal,
+    TerminalRun,
 }
 
 impl LaunchMode {
@@ -24,6 +30,7 @@ impl LaunchMode {
         match self {
             LaunchMode::Run => "▶ run",
             LaunchMode::Terminal => "⌨ terminal",
+            LaunchMode::TerminalRun => "⌨▶ terminal run",
         }
     }
 }

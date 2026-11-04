@@ -1,6 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Serialize` as well as `Deserialize` because launch history stores whole
+/// hits (see `src/history.rs`); the field renames below apply in both
+/// directions, so a stored entry is shaped exactly like the Elasticsearch
+/// document it came from and round-trips through the same code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackageHit {
     #[serde(rename = "package_attr_name", default)]
     pub attr_name: String,

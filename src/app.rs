@@ -1,3 +1,4 @@
+use crate::history::{self, LaunchMode};
 use crate::launch;
 use crate::search::{self, SearchMode, CHANNELS};
 use crate::types::PackageHit;
@@ -26,7 +27,9 @@ const LAUNCH_GRACE_PERIOD: Duration = Duration::from_secs(3);
 type SearchResult = Result<Vec<PackageHit>, String>;
 
 struct LaunchState {
-    pname: String,
+    /// The whole hit, not just its name: history is recorded from here once
+    /// the launch has actually got somewhere (see `poll_launching`).
+    hit: PackageHit,
     child: Child,
     log_path: PathBuf,
     log_offset: u64,
@@ -66,6 +69,13 @@ pub struct App {
     should_close: bool,
 
     launching: Option<LaunchState>,
+
+    /// Most-recent-first launch history, shown in place of results while the
+    /// query is empty. `showing_history` says whether `results` currently
+    /// holds those entries' hits (so a row can be drawn with the mode it was
+    /// launched in) rather than search results.
+    history: Vec<history::Entry>,
+    showing_history: bool,
 }
 
 impl App {
@@ -98,7 +108,43 @@ impl App {
             should_close: false,
 
             launching: None,
+
+            // Populated below: an empty query shows history, and the query
+            // starts empty, so this is what's on screen the instant the
+            // popup appears.
+            history: Vec::new(),
+            showing_history: false,
         }
+        .with_history(history::load())
+    }
+
+    fn with_history(mut self, history: Vec<history::Entry>) -> Self {
+        self.history = history;
+        self.show_history();
+        self
+    }
+
+    /// Puts the history's hits into `results` so that everything downstream —
+    /// row rendering, hover, ↑/↓, the detail panel, Enter and Ctrl+Enter —
+    /// works on history rows exactly as it does on search results, with no
+    /// parallel code path to keep in step. `showing_history` keeps the two
+    /// distinguishable for the bits that should differ (the mode pill, the
+    /// list header, the result count).
+    fn show_history(&mut self) {
+        self.results = self.history.iter().map(|e| e.hit.clone()).collect();
+        self.showing_history = !self.results.is_empty();
+        self.selected = 0;
+        self.hovered = None;
+    }
+
+    /// The mode a row was last launched in, for history rows only. Indices
+    /// line up because `results` is built from `history` in order, and both
+    /// are only ever rebuilt together in `show_history`.
+    fn history_mode(&self, idx: usize) -> Option<LaunchMode> {
+        if !self.showing_history {
+            return None;
+        }
+        self.history.get(idx).map(|e| e.mode)
     }
 
     fn channel(&self) -> search::Channel {
@@ -124,8 +170,9 @@ impl App {
 
     fn spawn_search(&mut self) {
         if self.query.trim().is_empty() {
-            self.results.clear();
-            self.selected = 0;
+            // Clearing the search box goes back to where you started rather
+            // than to an empty list.
+            self.show_history();
             self.in_flight = false;
             return;
         }
@@ -168,7 +215,7 @@ impl App {
         match launch::launch(&hit) {
             Ok(l) => {
                 self.launching = Some(LaunchState {
-                    pname: hit.pname,
+                    hit,
                     child: l.child,
                     log_path: l.log_path,
                     log_offset: 0,
@@ -200,7 +247,10 @@ impl App {
         };
         self.error = None;
         match launch::launch_in_terminal(&hit) {
-            Ok(_) => self.should_close = true,
+            Ok(_) => {
+                history::record(&mut self.history, &hit, LaunchMode::Terminal);
+                self.should_close = true;
+            }
             Err(e) => {
                 self.error = Some(format!("failed to open a terminal for {}: {e}", hit.pname));
             }
@@ -242,23 +292,34 @@ impl App {
             Err(_) => PollOutcome::Errored,
         };
 
-        match outcome {
+        // History is recorded here rather than at spawn time so that a
+        // launch that fails on the spot — typo'd attribute, no network,
+        // nothing with that `mainProgram` — doesn't end up at the top of
+        // the list you see next time. Every branch that closes the popup is
+        // one where the package either ran or got far enough that we handed
+        // it off to the background.
+        let launched = match outcome {
             PollOutcome::Running => {
                 if state.started.elapsed() >= LAUNCH_GRACE_PERIOD {
+                    let hit = state.hit.clone();
                     let _ = std::fs::remove_file(&state.log_path);
                     self.launching = None;
                     self.should_close = true;
+                    Some(hit)
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(50));
+                    None
                 }
             }
             PollOutcome::Finished(status) if status.success() => {
+                let hit = state.hit.clone();
                 let _ = std::fs::remove_file(&state.log_path);
                 self.launching = None;
                 self.should_close = true;
+                Some(hit)
             }
             PollOutcome::Finished(status) => {
-                let pname = state.pname.clone();
+                let pname = state.hit.pname.clone();
                 let tail = state.status_line.clone();
                 let _ = std::fs::remove_file(&state.log_path);
                 self.error = Some(if tail.is_empty() {
@@ -267,12 +328,18 @@ impl App {
                     format!("{pname} exited ({status}): {tail}")
                 });
                 self.launching = None;
+                None
             }
             PollOutcome::Errored => {
+                let hit = state.hit.clone();
                 let _ = std::fs::remove_file(&state.log_path);
                 self.launching = None;
                 self.should_close = true;
+                Some(hit)
             }
+        };
+        if let Some(hit) = launched {
+            history::record(&mut self.history, &hit, LaunchMode::Run);
         }
 
         self.launching.is_some()
@@ -284,7 +351,7 @@ impl App {
         };
         ui.vertical_centered(|ui| {
             ui.add_space(150.0);
-            ui.heading(format!("Launching {}...", state.pname));
+            ui.heading(format!("Launching {}...", state.hit.pname));
             ui.add_space(14.0);
             ui.add(
                 egui::ProgressBar::new(1.0)
@@ -385,9 +452,15 @@ impl App {
                 if self.in_flight {
                     ui.spinner();
                 } else {
-                    ui.add(
-                        egui::Label::new(format!("{} results", self.results.len())).truncate(),
-                    );
+                    // "recent" vs "results" is the clearest signal that the
+                    // list below isn't a search — the rows themselves look
+                    // the same by design.
+                    let count = if self.showing_history {
+                        format!("{} recent", self.results.len())
+                    } else {
+                        format!("{} results", self.results.len())
+                    };
+                    ui.add(egui::Label::new(count).truncate());
                 }
             });
         });
@@ -408,6 +481,8 @@ impl App {
             if self.results.is_empty() {
                 ui.add_space(12.0);
                 let msg = if self.query.trim().is_empty() {
+                    // Only reachable before anything has ever been launched;
+                    // otherwise an empty query shows the history instead.
                     "Start typing to search nixpkgs..."
                 } else if self.in_flight {
                     "Searching..."
@@ -418,11 +493,20 @@ impl App {
                 return;
             }
 
+            if self.showing_history {
+                ui.add_space(2.0);
+                ui.weak("Recently launched — start typing to search nixpkgs");
+                ui.add_space(6.0);
+            }
+
             let mut any_hovered = false;
 
             for idx in 0..self.results.len() {
                 let is_selected = idx == self.selected;
                 let is_hovered = self.hovered == Some(idx);
+                // Resolved before the row's closures borrow anything else,
+                // and `Some` only for history rows.
+                let launched_as = self.history_mode(idx);
                 let hit = &self.results[idx];
 
                 let bg = if is_selected {
@@ -469,6 +553,9 @@ impl App {
                         ui.add_space(3.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
+                            if let Some(mode) = launched_as {
+                                code_pill(ui, mode.label());
+                            }
                             ui.weak("Name:");
                             code_pill(ui, &hit.pname);
                             ui.weak("Version:");
@@ -675,6 +762,7 @@ impl eframe::App for App {
                 match result {
                     Ok(hits) => {
                         self.results = hits;
+                        self.showing_history = false;
                         self.selected = 0;
                         self.hovered = None;
                     }

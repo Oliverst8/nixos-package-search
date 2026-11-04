@@ -43,6 +43,8 @@ pub fn terminal_command_preview(hit: &PackageHit) -> Option<String> {
         NIX_SHELL.to_string(),
         "-p".to_string(),
         hit.attr_name.clone(),
+        "--run".to_string(),
+        format!("\"exec {}\"", terminal_shell()),
     ]);
     Some(parts.join(" "))
 }
@@ -107,6 +109,7 @@ pub fn launch_in_terminal(hit: &PackageHit) -> io::Result<Child> {
         // argv regardless of how it splits (or doesn't split) its arguments.
         .args(["/bin/sh", "-c", TERMINAL_SCRIPT, "nixos-package-search"])
         .arg(&hit.attr_name)
+        .arg(sh_quote(&terminal_shell()))
         .env(UNFREE.0, UNFREE.1)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -122,7 +125,9 @@ pub fn launch_in_terminal(hit: &PackageHit) -> io::Result<Child> {
     cmd.spawn()
 }
 
-/// Run inside the spawned terminal, with the nixpkgs attribute as `$1`.
+/// Run inside the spawned terminal, with the nixpkgs attribute as `$1` and
+/// the shell to land in as `$2` (already shell-quoted by [`terminal_shell`],
+/// so `--run` can interpolate it directly).
 ///
 /// The build/fetch is done by an explicit `--run true` pass first, rather
 /// than just dropping straight into `nix-shell -p "$1"`: that way a failure
@@ -139,8 +144,24 @@ nix-shell -p "$1" --run true || {
     read -r _
     exit "$st"
 }
-exec nix-shell -p "$1"
+exec nix-shell -p "$1" --run "exec $2"
 "#;
+
+/// The shell terminal mode lands you in. `nix-shell`'s own interactive shell
+/// is always bash, which isn't much use if your prompt, aliases, completions
+/// and history all live in zsh — so the package environment is entered with
+/// `--run "exec zsh"` instead, which keeps the environment and swaps the
+/// shell. Falls back to `$SHELL`, then to leaving bash alone, on a machine
+/// without zsh.
+fn terminal_shell() -> String {
+    if resolve_binary("zsh").is_some() {
+        return "zsh".to_string();
+    }
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "bash".to_string())
+}
 
 /// What `--run` gets: the package's best-guess binary. `exec` so the wrapping
 /// bash doesn't hang around as a parent of the actual program, which also

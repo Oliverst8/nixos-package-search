@@ -4,7 +4,8 @@ A search-as-you-type popup for nixpkgs. Type a package name, see its
 description/license/homepage/etc. as you hover or move through the results,
 and hit Enter to run it from a throwaway `nix-shell` — no need to have it
 installed. Ctrl+Enter instead drops you into a terminal sitting in that
-shell, for CLI tools you want a prompt with.
+shell, for CLI tools you want a prompt with. It opens on your recent
+launches, so re-running something you reached for yesterday is Enter.
 
 ```
 Running google-chrome would normally mean installing it first. This tool
@@ -13,7 +14,8 @@ does the equivalent of:
     NIXPKGS_ALLOW_UNFREE=1 nix-shell -p google-chrome \
       --run "exec google-chrome-stable"            # Enter
 
-    ghostty -e nix-shell -p ripgrep                # Ctrl+Enter
+    ghostty -e nix-shell -p ripgrep \
+      --run "exec zsh"                           # Ctrl+Enter
 
 for whatever you selected, spawned detached so it survives the popup closing.
 ```
@@ -32,6 +34,13 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
 
 ## Usage
 
+- **It opens on your launch history** — the packages you last ran, newest
+  first, drawn as the same rows a search draws, with a pill saying whether
+  each one was last launched normally (`▶ run`) or in a terminal
+  (`⌨ terminal`). That's only a record of what you did last time, not a
+  constraint: Enter and Ctrl+Enter both work on a history row exactly as
+  they do on a search result. Clearing the search box brings the list back.
+  History isn't searchable — typing searches nixpkgs, as it always did.
 - Start typing — results update ~150ms after you stop (debounced).
 - **Hover** a result (or use ↑/↓) to see its full description, license,
   maintainers, homepage, provided binaries, and nixpkgs source position in
@@ -53,7 +62,9 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
   which is what you want for anything with a CLI, where one fire-and-forget
   run of a single binary isn't the point: you get a prompt with the package
   (and everything it brings with it) on `$PATH`, for as long as you keep the
-  terminal open. There's no loading screen for this one, because the
+  terminal open. You land in **zsh** (falling back to `$SHELL`, then bash),
+  not in `nix-shell`'s own bash, so your prompt, aliases and completions are
+  there too. There's no loading screen for this one, because the
   terminal itself is showing you nix's output; the popup just gets out of
   the way. If the launch fails, the terminal stays open with the error on
   screen rather than blinking out of existence.
@@ -91,11 +102,15 @@ NIXPKGS_ALLOW_UNFREE=1 setsid nix-shell -p <attr> --run "exec <mainProgram>"
 and terminal mode runs, detached the same way:
 
 ```sh
-<terminal> -e /bin/sh -c '<script>' nixos-package-search <attr>
+<terminal> -e /bin/sh -c '<script>' nixos-package-search <attr> <shell>
 ```
 
 where `<script>` does `nix-shell -p "$1" --run true` first and only then
-`exec nix-shell -p "$1"`. The first pass is what does the fetching/building,
+`exec nix-shell -p "$1" --run "exec $2"`. Entering the package environment
+via `--run "exec zsh"` is what gets you a zsh instead of the bash
+`nix-shell` would otherwise drop you in — same environment, different
+shell, and `exec` so no bash is left sitting underneath it. The first pass
+is what does the fetching/building,
 so a failure there (unknown attribute, no network, a build error) is
 something the script can *see* and pause on — otherwise the terminal window
 would vanish a fraction of a second after appearing, taking the error with
@@ -127,6 +142,30 @@ In app mode stdout/stderr are redirected to a temp file (not a pipe or
 `/dev/null`) so the app can tail it for the loading screen's status line
 without risking a `SIGPIPE` in the launched program if the popup exits
 while it's still writing.
+
+### Launch history
+
+Every launch that actually got somewhere is recorded in
+`$XDG_STATE_HOME/nixos-package-search/history.json` (so
+`~/.local/state/nixos-package-search/history.json` by default) — state
+rather than `~/.config` or `~/.cache`, which is exactly the case the XDG
+base directory spec gives history as an example of. The file is written to
+a temp file and renamed into place, since the popup is routinely killed
+moments after a launch; a half-written or unreadable file just means an
+empty history rather than a failure, as does a missing `$HOME`.
+
+Each entry stores the *whole* search hit, not just the attribute name, so
+the history list renders identical rows to a search (description, version,
+license, outputs, homepage) and the detail panel works on them — all
+without the one screen that must appear instantly depending on the network.
+Entries are deduplicated by attribute name (most recent wins, and carries
+the mode you last used), and the list is capped at 50.
+
+A launch is only recorded once it's got somewhere: in app mode that means
+after the child has survived its first moments, so a typo'd attribute or a
+missing `mainProgram` that fails on the spot doesn't end up at the top of
+the list next time. Terminal mode records at spawn, since the popup hands
+off to the terminal and stops watching.
 
 The Elasticsearch index name is versioned
 (`latest-<schema-version>-nixos-<channel>`); `SCHEMA_VERSION` in
@@ -191,6 +230,7 @@ on what you need:
 
 - `src/search.rs` — Elasticsearch query building + HTTP client, channel list
 - `src/types.rs` — response deserialization
+- `src/history.rs` — launch history: XDG state file, load/record/save
 - `src/launch.rs` — builds and spawns the `nix-shell` launch commands
   (app mode and terminal mode), plus terminal-emulator detection
 - `src/app.rs` — the egui UI: search box, results list, detail pane, keybindings

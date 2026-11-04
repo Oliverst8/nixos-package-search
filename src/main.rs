@@ -1,4 +1,5 @@
 mod app;
+mod history;
 mod launch;
 mod search;
 mod types;

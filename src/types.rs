@@ -32,6 +32,12 @@ pub struct PackageHit {
     pub platforms: Vec<String>,
     #[serde(rename = "package_position", default)]
     pub position: Option<String>,
+    /// `{ icon name: "<md5>.<png|svg>" }`, new in index schema 52 — the file
+    /// names search.nixos.org serves under `/icons/`. Empty for anything
+    /// without a desktop entry (every CLI tool), and for history entries
+    /// recorded before this field existed. See `src/icons.rs`.
+    #[serde(rename = "package_desktop_icons", default)]
+    pub desktop_icons: std::collections::BTreeMap<String, String>,
 }
 
 impl PackageHit {

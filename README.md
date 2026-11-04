@@ -35,9 +35,9 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
 ## Usage
 
 - **It opens on your launch history** — the packages you last ran, newest
-  first, drawn as the same rows a search draws, with a pill saying whether
-  each one was last launched normally (`▶ run`) or in a terminal
-  (`⌨ terminal`). That's only a record of what you did last time, not a
+  first, drawn as the same rows a search draws, each with its application
+  icon and a pill saying whether it was last launched normally (`▶ run`) or
+  in a terminal (`⌨ terminal`). That's only a record of what you did last time, not a
   constraint: Enter and Ctrl+Enter both work on a history row exactly as
   they do on a search result. Clearing the search box brings the list back.
   History isn't searchable — typing searches nixpkgs, as it always did.
@@ -161,37 +161,86 @@ without the one screen that must appear instantly depending on the network.
 Entries are deduplicated by attribute name (most recent wins, and carries
 the mode you last used), and the list is capped at 50.
 
+### History icons
+
+Since index schema 52 each package document carries
+`package_desktop_icons` — a `{ icon name: "<md5>.<png|svg>" }` map of files
+search.nixos.org serves under `/icons/`, which its own frontend renders the
+same way. That map is the only reason icons are possible here at all: a
+package's icon otherwise lives inside a store path that doesn't exist until
+you've built the package.
+
+History entries store the whole index document, so the icon reference comes
+along for free. The file itself is fetched once and cached in
+`$XDG_CACHE_HOME/nixos-package-search/icons/` (`~/.cache/...`) — cache
+rather than state, since every one of them can be downloaded again. Fetching
+and decoding happen on a worker thread, so the history list is on screen
+before any of it starts; measured against the previous build, icons cost
+nothing at startup (84 ms vs 89 ms median to window-on-screen).
+
+Roughly 57% of the icons in the index are PNG and 43% SVG, so both are
+decoded: PNG through `image` (already in the dependency tree via
+eframe/arboard, with exactly the `png` feature, so it costs no new crates)
+and SVG through `resvg` built **without** its text/font features — 11 new
+crates instead of 30, on the grounds that an application icon is shapes
+rather than text.
+
+A package with no icon is the normal case for CLI tools, which have no
+desktop entry: those get their initial in a faint chip, so the column stays
+aligned instead of leaving a hole. History entries recorded before schema 52
+have no icon reference either and look the same until you launch them again.
+
 A launch is only recorded once it's got somewhere: in app mode that means
 after the child has survived its first moments, so a typo'd attribute or a
 missing `mainProgram` that fails on the spot doesn't end up at the top of
 the list next time. Terminal mode records at spawn, since the popup hands
 off to the terminal and stops watching.
 
-The Elasticsearch index name is versioned
-(`latest-<schema-version>-nixos-<channel>`); `SCHEMA_VERSION` in
-`src/search.rs` may need bumping if search.nixos.org changes its schema and
-searches start failing with `index_not_found_exception` — check the site's
-page source for the current `elasticsearchMappingSchemaVersion`.
+### Search ranking: ported, not reconstructed
 
-### A note on search ranking
+`src/search.rs` is a port of `packagesRanking` and `encodeRequestBody` from
+search.nixos.org's own frontend — [`frontend/src/Search/Query.elm`] in
+NixOS/nixos-search — clause for clause, field for field, boost for boost, in
+the order that file builds them. Not a reconstruction from a captured
+request: the site's ranking is, in its own source's words, "the champion of
+an evolutionary search over the clause structure, the fields and the boosts",
+so no single number in it can be reasoned about on its own, and the previous
+hand-tuned approximation here drifted badly from the real results.
 
-`src/search.rs`'s query is a direct port of the query search.nixos.org's own
-frontend sends this same backend (captured from its network tab), not a
-guessed-at reconstruction: a `cross_fields` match across attr name/programs/
-pname/description weighted the same way the real site weights them, a fuzzy
-pass for typo tolerance, a substring `wildcard` for mid-string hits ("chrome"
-inside `google-chrome`), `package_repology_repos`/`package_dep_count` as
-`rank_feature` popularity signals, and a final rescore pass that explicitly
-rewards shorter attribute names. See the comments in `match_search` and
-`build_query` for the full breakdown of each clause.
+[`frontend/src/Search/Query.elm`]: https://github.com/NixOS/nixos-search/blob/main/frontend/src/Search/Query.elm
 
-Notably, the real site does *not* normalize multi-word queries into
-nixpkgs' hyphenated naming — searching "google chrome" does not rank
-`google-chrome` first there, nor "docker compose" → `docker-compose`; an
-earlier version of this query invented that normalization on the (wrong)
-assumption it was obviously how the real site must behave. Matching the
-*real* query, including its quirks, generalizes far better across arbitrary
-searches than tuning boost numbers against a handful of examples does.
+What that buys, concretely: the query is one `dis_max` over a phrase match on
+the descriptions (so a search that names no package still matches), a fuzzy
+pass on the *last* word, and each word as `*word*` against the attribute
+name — plus `should` clauses for the words glued back into an attribute name
+(`google chrome` → a `term` on `google-chrome` boosted ×127, which is what
+puts it first), prefix matches on name and pname, a `cross_fields` pass over
+everything *but* the last word, two `rank_feature` popularity reads of
+`package_repology_repos`, a `package_dep_count` signal, and the query read
+as a program path (`python.http.server`). A final rescore over the top 100
+divides by attribute-name length.
+
+Two things fall out of the port for free:
+
+- **`-word` excludes.** `python -wrapper` drops anything whose attribute name
+  contains "wrapper", in each of its dash/underscore spellings. That's the
+  site's own syntax, peeled off before the ranking ever sees the words.
+- **Dash/underscore spellings.** `home_manager` also searches `home-manager`.
+
+`cargo test` checks the generated request against the real site's captured
+request body byte for byte (`query_body_matches_the_real_site_request`), so
+"tidying up" a boost fails the build rather than silently changing results.
+The `--ignored` tests then check the *results*: "google chrome" returns
+`google-chrome`, `python314Packages.google`, `python313Packages.google`,
+`chromium` — the same four, in that order, that the real site returns.
+
+The site's `aggs` block is deliberately not sent: it feeds the facet sidebar,
+which this app doesn't have, and it changes neither the hits nor their order.
+
+The index name carries a schema version (`latest-<version>-nixos-<channel>`,
+currently **52**). When search.nixos.org bumps it, every search here starts
+failing with `index_not_found_exception` — check the site's network tab for
+the index it queries and update `SCHEMA_VERSION` in `src/search.rs`.
 
 ## Hyprland integration
 
@@ -231,6 +280,7 @@ on what you need:
 - `src/search.rs` — Elasticsearch query building + HTTP client, channel list
 - `src/types.rs` — response deserialization
 - `src/history.rs` — launch history: XDG state file, load/record/save
+- `src/icons.rs` — history icons: index icon lookup, XDG cache, PNG/SVG decode
 - `src/launch.rs` — builds and spawns the `nix-shell` launch commands
   (app mode and terminal mode), plus terminal-emulator detection
 - `src/app.rs` — the egui UI: search box, results list, detail pane, keybindings

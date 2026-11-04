@@ -1,8 +1,10 @@
 use crate::history::{self, LaunchMode};
+use crate::icons;
 use crate::launch;
 use crate::search::{self, SearchMode, CHANNELS};
 use crate::types::PackageHit;
 use eframe::egui;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -76,11 +78,23 @@ pub struct App {
     /// launched in) rather than search results.
     history: Vec<history::Entry>,
     showing_history: bool,
+
+    /// Decoded icons by index file name, `None` once we've tried and found
+    /// there's nothing to draw (a CLI tool with no desktop entry, a 404, an
+    /// entry recorded before the index carried icons). `icon_queue` holds
+    /// the files not yet asked for; it's drained into a worker thread from
+    /// the first frame, because loading them touches the network and the
+    /// disk and the history list has to be on screen before either.
+    icon_textures: HashMap<String, Option<egui::TextureHandle>>,
+    icon_queue: Vec<String>,
+    icon_tx: Sender<(String, Option<icons::Rgba>)>,
+    icon_rx: Receiver<(String, Option<icons::Rgba>)>,
 }
 
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = channel();
+        let (icon_tx, icon_rx) = channel();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(8))
             .user_agent("nixos-package-search/0.1")
@@ -114,6 +128,10 @@ impl App {
             // popup appears.
             history: Vec::new(),
             showing_history: false,
+            icon_textures: HashMap::new(),
+            icon_queue: Vec::new(),
+            icon_tx,
+            icon_rx,
         }
         .with_history(history::load())
     }
@@ -135,6 +153,99 @@ impl App {
         self.showing_history = !self.results.is_empty();
         self.selected = 0;
         self.hovered = None;
+
+        for hit in &self.results {
+            if let Some(file) = icons::icon_file(hit) {
+                if !self.icon_textures.contains_key(file)
+                    && !self.icon_queue.iter().any(|q| q == file)
+                {
+                    self.icon_queue.push(file.to_string());
+                }
+            }
+        }
+    }
+
+    /// Hands whatever icons we don't have yet to one worker thread. One
+    /// thread rather than one per icon: a cached icon is a file read, an
+    /// uncached one is a small HTTP GET on a connection the client already
+    /// pools, and a history list is a handful of rows.
+    fn spawn_icon_loader(&mut self, ctx: &egui::Context) {
+        if self.icon_queue.is_empty() {
+            return;
+        }
+        let files = std::mem::take(&mut self.icon_queue);
+        let client = self.client.clone();
+        let tx = self.icon_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            for file in files {
+                let loaded = icons::load(&client, &file);
+                if tx.send((file, loaded)).is_err() {
+                    return;
+                }
+                // The popup is idle while this runs; without this the icon
+                // would only appear on the next keystroke or mouse move.
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Uploads decoded icons as textures. Keyed by file name, so the same
+    /// icon shared by two packages is uploaded once.
+    fn take_loaded_icons(&mut self, ctx: &egui::Context) {
+        while let Ok((file, loaded)) = self.icon_rx.try_recv() {
+            let texture = loaded.map(|rgba| {
+                ctx.load_texture(
+                    format!("icon:{file}"),
+                    egui::ColorImage::from_rgba_unmultiplied(rgba.size, &rgba.pixels),
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.icon_textures.insert(file, texture);
+        }
+    }
+
+    /// The icon square at the start of a history row. Always takes up the
+    /// same space whether or not there's an icon to put in it, so the text
+    /// beside it lines up down the list; a package with no icon (every CLI
+    /// tool, since an icon comes from a desktop entry) gets its initial in a
+    /// faint chip instead of a hole in the layout.
+    fn draw_icon_slot(&self, ui: &mut egui::Ui, hit: &PackageHit) {
+        const SLOT: f32 = 40.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(SLOT, SLOT), egui::Sense::hover());
+
+        let texture = icons::icon_file(hit)
+            .and_then(|file| self.icon_textures.get(file))
+            .and_then(|texture| texture.as_ref());
+
+        if let Some(texture) = texture {
+            // Fit inside the square rather than filling it: these are a mix
+            // of square PNGs and whatever aspect the SVG happened to have.
+            let size = texture.size_vec2();
+            let scale = (SLOT / size.x).min(SLOT / size.y).min(1.0);
+            let fitted = egui::Rect::from_center_size(rect.center(), size * scale);
+            egui::Image::new(texture).paint_at(ui, fitted);
+        } else {
+            let initial = hit
+                .pname
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default();
+            ui.painter().rect_filled(
+                rect,
+                10.0,
+                elevated(ui.visuals(), ui.visuals().panel_fill, 18),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initial,
+                egui::FontId::proportional(18.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        ui.add_space(10.0);
     }
 
     /// The mode a row was last launched in, for history rows only. Indices
@@ -524,66 +635,80 @@ impl App {
 
                 let row = row_frame.show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.vertical(|ui| {
-                        // Title is the nixpkgs attribute name (e.g.
-                        // "firefox-esr-140-unwrapped"), same as
-                        // search.nixos.org's result cards — not the pname,
-                        // which is often shared by several attrs.
-                        let mut title = egui::RichText::new(&hit.attr_name).size(16.0);
-                        title = title.color(if is_selected {
-                            ui.visuals().selection.stroke.color
-                        } else {
-                            ui.visuals().hyperlink_color
-                        });
-                        // `.truncate()` clips to however many pixels are
-                        // actually available (ellipsis, single line) instead
-                        // of wrapping — needed because a long attr name is
-                        // one unbroken token with no space to wrap at, so
-                        // without this it would just overflow past the row
-                        // uncontained, same as the untruncated grid values
-                        // did in the detail panel (see MAX_VALUE below).
-                        ui.add(egui::Label::new(title).truncate());
-
-                        if let Some(desc) = &hit.description {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(desc).size(13.0)).truncate(),
-                            );
+                    // A `Frame`'s contents lay out top-down, so the icon
+                    // needs an explicit left-to-right region to sit *beside*
+                    // the text rather than above it. The icon column only
+                    // exists on history rows; search results keep the full
+                    // width they always had.
+                    ui.horizontal_top(|ui| {
+                        if launched_as.is_some() {
+                            self.draw_icon_slot(ui, &self.results[idx]);
                         }
-
-                        ui.add_space(3.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            if let Some(mode) = launched_as {
-                                code_pill(ui, mode.label());
-                            }
-                            ui.weak("Name:");
-                            code_pill(ui, &hit.pname);
-                            ui.weak("Version:");
-                            code_pill(ui, if hit.version.is_empty() {
-                                "-"
+                        ui.vertical(|ui| {
+                            // Title is the nixpkgs attribute name (e.g.
+                            // "firefox-esr-140-unwrapped"), same as
+                            // search.nixos.org's result cards — not the pname,
+                            // which is often shared by several attrs.
+                            let mut title = egui::RichText::new(&hit.attr_name).size(16.0);
+                            title = title.color(if is_selected {
+                                ui.visuals().selection.stroke.color
                             } else {
-                                &hit.version
+                                ui.visuals().hyperlink_color
                             });
-                            if !hit.outputs.is_empty() {
-                                ui.weak("Outputs:");
-                                for o in &hit.outputs {
-                                    code_pill(ui, o);
-                                }
-                            }
-                            if let Some(home) = hit.homepage.first() {
-                                ui.hyperlink_to("🌐 Homepage", home);
-                            }
-                        });
+                            // `.truncate()` clips to however many pixels are
+                            // actually available (ellipsis, single line) instead
+                            // of wrapping — needed because a long attr name is
+                            // one unbroken token with no space to wrap at, so
+                            // without this it would just overflow past the row
+                            // uncontained, same as the untruncated grid values
+                            // did in the detail panel (see MAX_VALUE below).
+                            ui.add(egui::Label::new(title).truncate());
 
-                        if !hit.licenses.is_empty() {
+                            if let Some(desc) = &hit.description {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(desc).size(13.0))
+                                        .truncate(),
+                                );
+                            }
+
+                            ui.add_space(3.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.weak("License:");
-                                for l in &hit.licenses {
-                                    code_pill(ui, l);
+                                if let Some(mode) = launched_as {
+                                    code_pill(ui, mode.label());
+                                }
+                                ui.weak("Name:");
+                                code_pill(ui, &hit.pname);
+                                ui.weak("Version:");
+                                code_pill(
+                                    ui,
+                                    if hit.version.is_empty() {
+                                        "-"
+                                    } else {
+                                        &hit.version
+                                    },
+                                );
+                                if !hit.outputs.is_empty() {
+                                    ui.weak("Outputs:");
+                                    for o in &hit.outputs {
+                                        code_pill(ui, o);
+                                    }
+                                }
+                                if let Some(home) = hit.homepage.first() {
+                                    ui.hyperlink_to("🌐 Homepage", home);
                                 }
                             });
-                        }
+
+                            if !hit.licenses.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.weak("License:");
+                                    for l in &hit.licenses {
+                                        code_pill(ui, l);
+                                    }
+                                });
+                            }
+                        });
                     });
                 });
 
@@ -756,6 +881,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.take_loaded_icons(ctx);
+        self.spawn_icon_loader(ctx);
         while let Ok((req_gen, result)) = self.rx.try_recv() {
             if req_gen == self.generation {
                 self.in_flight = false;

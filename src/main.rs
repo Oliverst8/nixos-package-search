@@ -1,5 +1,6 @@
 mod app;
 mod history;
+mod icons;
 mod launch;
 mod search;
 mod types;

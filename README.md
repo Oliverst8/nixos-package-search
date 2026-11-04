@@ -1,5 +1,5 @@
 # nixos-package-search
-
+**100% AI GENERATED USE AT OWN RISK**
 A search-as-you-type popup for nixpkgs. Type a package name, see its
 description/license/homepage/etc. as you hover or move through the results,
 and hit Enter to run it from a throwaway `nix-shell` — no need to have it

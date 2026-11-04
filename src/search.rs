@@ -12,34 +12,29 @@ const ES_PASS: &str = "X8gPHnzL52wFEekuxsfQ9cSh";
 /// source for the current `elasticsearchMappingSchemaVersion` and update this.
 const SCHEMA_VERSION: u32 = 51;
 
-/// Channels mirror search.nixos.org's channels.json. `flake_ref` is the exact
-/// nixpkgs revision-tracking ref used to launch packages, so results always
-/// come from (and launch against) the same channel.
+/// Channels mirror search.nixos.org's channels.json, and pick which
+/// Elasticsearch index gets searched. They no longer decide what a launch
+/// resolves against: launching uses the local `<nixpkgs>` via `nix-shell -p`
+/// (see `src/launch.rs`), which is far faster than fetching a channel's
+/// nixpkgs tarball per launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Channel {
     pub id: &'static str,
-    pub branch: &'static str,
     pub label: &'static str,
 }
 
 pub const CHANNELS: &[Channel] = &[
     Channel {
         id: "unstable",
-        branch: "nixos-unstable",
         label: "unstable",
     },
     Channel {
         id: "26.05",
-        branch: "nixos-26.05",
         label: "26.05 (stable)",
     },
 ];
 
 impl Channel {
-    pub fn flake_ref(&self) -> String {
-        format!("github:NixOS/nixpkgs/{}", self.branch)
-    }
-
     fn index_name(&self) -> String {
         format!("latest-{}-nixos-{}", SCHEMA_VERSION, self.id)
     }

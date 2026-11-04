@@ -2,15 +2,18 @@
 
 A search-as-you-type popup for nixpkgs. Type a package name, see its
 description/license/homepage/etc. as you hover or move through the results,
-hit Enter, and it launches the package in a throwaway `nix shell` — no need
-to have it installed.
+and hit Enter to run it from a throwaway `nix-shell` — no need to have it
+installed. Ctrl+Enter instead drops you into a terminal sitting in that
+shell, for CLI tools you want a prompt with.
 
 ```
-nix run github:NixOS/nixpkgs/nixos-unstable#google-chrome would normally
-require installing google-chrome first. This tool does the equivalent of:
+Running google-chrome would normally mean installing it first. This tool
+does the equivalent of:
 
-    nix shell github:NixOS/nixpkgs/nixos-unstable#google-chrome \
-      --command google-chrome-stable
+    NIXPKGS_ALLOW_UNFREE=1 nix-shell -p google-chrome \
+      --run "exec google-chrome-stable"            # Enter
+
+    ghostty -e nix-shell -p ripgrep                # Ctrl+Enter
 
 for whatever you selected, spawned detached so it survives the popup closing.
 ```
@@ -33,7 +36,8 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
 - **Hover** a result (or use ↑/↓) to see its full description, license,
   maintainers, homepage, provided binaries, and nixpkgs source position in
   the right-hand panel.
-- **Enter** or double-click launches the hovered/selected package. This
+- **Enter** or double-click runs the hovered/selected package's main
+  program (there's also a **▶ Run** button in the detail panel). This
   shows a loading screen (with the live tail of `nix`'s own output as the
   status line) instead of closing immediately: launching keeps running in
   the background either way, but the loading screen sticks around long
@@ -44,12 +48,28 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
   a few seconds, trusting the detached process to keep going on its own.
   Esc during loading cancels the launch outright. The exact command it's
   about to run is shown at the bottom of the detail panel before you launch.
+- **Ctrl+Enter** (or Shift+Enter, or the **⌨ Terminal** button) opens a
+  terminal emulator sitting *inside* that package's `nix-shell` instead —
+  which is what you want for anything with a CLI, where one fire-and-forget
+  run of a single binary isn't the point: you get a prompt with the package
+  (and everything it brings with it) on `$PATH`, for as long as you keep the
+  terminal open. There's no loading screen for this one, because the
+  terminal itself is showing you nix's output; the popup just gets out of
+  the way. If the launch fails, the terminal stays open with the error on
+  screen rather than blinking out of existence.
+
+  Which terminal gets used: `$TERMINAL` if you've set it, otherwise the
+  first one actually installed out of ghostty, kitty, foot, alacritty,
+  wezterm, konsole, gnome-terminal, xfce4-terminal, terminator, urxvt, st,
+  xterm. Set `$TERMINAL` if that guess picks the wrong one.
 - **Tab** switches between *Packages* search (name + description) and
   *Programs* search (search by the binary a package provides — e.g. typing
   `rg` finds `ripgrep`).
 - **Ctrl+Tab** switches the channel between `unstable` (default) and the
-  current stable release. This affects both what shows up in results and
-  which nixpkgs revision gets used to launch it.
+  current stable release. This affects *search results only* — launching
+  always uses your system's own nixpkgs (see below), so a package you find
+  on one channel but don't have on the other will report that when you try
+  to run it.
 - **Esc**, or clicking away from the window, closes it.
 
 ## How it works
@@ -65,22 +85,48 @@ nixpkgs locally.
 Launching runs:
 
 ```sh
-NIXPKGS_ALLOW_UNFREE=1 setsid nix --extra-experimental-features "nix-command flakes" \
-  shell --impure github:NixOS/nixpkgs/nixos-<channel>#<attr> --command <mainProgram>
+NIXPKGS_ALLOW_UNFREE=1 setsid nix-shell -p <attr> --run "exec <mainProgram>"
 ```
+
+and terminal mode runs, detached the same way:
+
+```sh
+<terminal> -e /bin/sh -c '<script>' nixos-package-search <attr>
+```
+
+where `<script>` does `nix-shell -p "$1" --run true` first and only then
+`exec nix-shell -p "$1"`. The first pass is what does the fetching/building,
+so a failure there (unknown attribute, no network, a build error) is
+something the script can *see* and pause on — otherwise the terminal window
+would vanish a fraction of a second after appearing, taking the error with
+it. Interactive `nix-shell` exits with the status of whatever you last ran
+in it, so its own exit code can't be used for that. The second invocation
+re-evaluates against a warm cache and costs about half a second. The script
+is passed as a single argument with the attribute as `$1`, so no package
+name is ever re-parsed by a shell, and every terminal's `-e`-ish convention
+sees one tidy argv.
+
+This deliberately uses **legacy `nix-shell -p` against your system's
+`<nixpkgs>`**, not `nix shell github:NixOS/nixpkgs/nixos-<channel>#<attr>`.
+The flake form has to fetch, lock and evaluate an entire nixpkgs tarball for
+the channel before it can even look at the package, which costs seconds on
+every single launch; the local nixpkgs is already on disk and evaluates in
+well under a second. The trade-off is that the channel picker only selects
+which search index gets queried — in practice the local nixpkgs is the one
+whose packages are already in your store anyway.
 
 `mainProgram` comes straight from the package's metadata (falling back to
 the package name), so the right binary gets run even when it doesn't match
 the attribute name — e.g. `google-chrome` → `google-chrome-stable`.
 `setsid` detaches the process so it keeps running after the popup exits.
-`NIXPKGS_ALLOW_UNFREE=1`/`--impure` are there so unfree packages (Chrome,
-Steam, ...) actually launch instead of failing with a license-refusal error
-— `--impure` is required for the env var to have any effect during flake
-evaluation, which is otherwise pure.
-stdout/stderr are redirected to a temp file (not a pipe or `/dev/null`) so
-the app can tail it for the loading screen's status line without risking a
-`SIGPIPE` in the launched program if the popup exits while it's still
-writing.
+`NIXPKGS_ALLOW_UNFREE=1` is there so unfree packages (Chrome, Steam, ...)
+actually launch instead of failing with a license-refusal error; unlike the
+`nix shell` flake form, plain `nix-shell` honors it without also needing
+`--impure`.
+In app mode stdout/stderr are redirected to a temp file (not a pipe or
+`/dev/null`) so the app can tail it for the loading screen's status line
+without risking a `SIGPIPE` in the launched program if the popup exits
+while it's still writing.
 
 The Elasticsearch index name is versioned
 (`latest-<schema-version>-nixos-<channel>`); `SCHEMA_VERSION` in
@@ -133,7 +179,7 @@ on what you need:
 
 | Tool | Good for | Trade-off |
 |---|---|---|
-| **This tool / search.nixos.org / `nix-search-cli`** | Instant, rich results (description, license, maintainers) as you type | Needs network; index is a snapshot, not your exact local nixpkgs checkout |
+| **This tool / search.nixos.org / `nix-search-cli`** | Instant, rich results (description, license, maintainers) as you type | Needs network; the index is a snapshot of a channel, while launching uses your local nixpkgs |
 | `nix search nixpkgs <regex>` | Searching *your* local nixpkgs flake input exactly | Slow on first run (builds an eval cache); no long description in output |
 | `nix-env -qaP --description '<regex>'` | Pre-flakes, channel-based search | Legacy; requires nix-channels set up |
 | `nix-locate` (from [nix-index](https://github.com/nix-community/nix-index)) | "Which package has file/binary X" from a local index | Needs a one-time local database build (~GBs) |
@@ -145,7 +191,8 @@ on what you need:
 
 - `src/search.rs` — Elasticsearch query building + HTTP client, channel list
 - `src/types.rs` — response deserialization
-- `src/launch.rs` — builds and spawns the `nix shell` launch command
+- `src/launch.rs` — builds and spawns the `nix-shell` launch commands
+  (app mode and terminal mode), plus terminal-emulator detection
 - `src/app.rs` — the egui UI: search box, results list, detail pane, keybindings
 - `src/main.rs` — window setup (borderless, fixed size, `app_id` for window rules)
 - `flake.nix` — devShell + package build (`rustPlatform.buildRustPackage`)

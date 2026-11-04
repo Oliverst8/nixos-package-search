@@ -165,7 +165,7 @@ impl App {
             return;
         };
         self.error = None;
-        match launch::launch(self.channel(), &hit) {
+        match launch::launch(&hit) {
             Ok(l) => {
                 self.launching = Some(LaunchState {
                     pname: hit.pname,
@@ -178,6 +178,31 @@ impl App {
             }
             Err(e) => {
                 self.error = Some(format!("failed to launch {}: {e}", hit.pname));
+            }
+        }
+    }
+
+    /// Terminal mode: hands the package to a terminal emulator sitting in its
+    /// `nix-shell`, for CLI tools you want a prompt with rather than a single
+    /// run of one binary. Unlike [`Self::launch_selected`] there's no loading
+    /// screen to keep around — the terminal window is itself the progress
+    /// display, and it reports its own failures (see `launch::launch_in_terminal`)
+    /// — so the popup gets out of the way immediately.
+    fn open_terminal_selected(&mut self) {
+        if self.launching.is_some() {
+            return;
+        }
+        let Some(idx) = self.active_index() else {
+            return;
+        };
+        let Some(hit) = self.results.get(idx).cloned() else {
+            return;
+        };
+        self.error = None;
+        match launch::launch_in_terminal(&hit) {
+            Ok(_) => self.should_close = true,
+            Err(e) => {
+                self.error = Some(format!("failed to open a terminal for {}: {e}", hit.pname));
             }
         }
     }
@@ -513,6 +538,15 @@ impl App {
         let Some(hit) = self.results.get(idx).cloned() else {
             return;
         };
+        // Which terminal (if any) we'd use is a `$PATH` lookup, so resolve
+        // it once per frame up here rather than inside the button and the
+        // preview separately.
+        let terminal_cmd = launch::terminal_command_preview(&hit);
+        // The buttons below are drawn while `ui` holds a borrow of `self`'s
+        // drawing closure; acting on them is deferred to the end of the
+        // function, where calling back into `&mut self` is free of it.
+        let mut run_clicked = false;
+        let mut terminal_clicked = false;
 
         ui.heading(&hit.pname);
         ui.label(format!("{}  ·  v{}", hit.attr_name, hit.version));
@@ -584,16 +618,50 @@ impl App {
 
         ui.add_space(10.0);
         ui.separator();
-        ui.add_space(6.0);
-        ui.label("will run:");
-        // Same overflow hazard as the grid above: this is one long line, so
-        // wrap it token-by-token instead of handing a single wide Label to
-        // the scroll area.
-        ui.horizontal_wrapped(|ui| {
-            for token in launch::command_preview(self.channel(), &hit).split(' ') {
-                ui.code(token);
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            if ui
+                .button("▶  Run")
+                .on_hover_text("Enter — run the package's main program")
+                .clicked()
+            {
+                run_clicked = true;
+            }
+            if ui
+                .add_enabled(terminal_cmd.is_some(), egui::Button::new("⌨  Terminal"))
+                .on_hover_text("Ctrl+Enter — open a terminal inside this package's nix-shell")
+                .clicked()
+            {
+                terminal_clicked = true;
             }
         });
+
+        ui.add_space(8.0);
+        ui.weak("Enter runs:");
+        command_preview(ui, &launch::command_preview(&hit));
+
+        ui.add_space(6.0);
+        ui.weak("Ctrl+Enter opens:");
+        match &terminal_cmd {
+            Some(cmd) => command_preview(ui, cmd),
+            // Only reachable with no terminal emulator installed at all;
+            // say so here rather than letting the button silently do
+            // nothing (it's disabled above for the same reason).
+            None => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "no terminal emulator found — set $TERMINAL",
+                );
+            }
+        }
+
+        if run_clicked {
+            self.launch_selected();
+        }
+        if terminal_clicked {
+            self.open_terminal_selected();
+        }
     }
 }
 
@@ -644,11 +712,15 @@ impl eframe::App for App {
             if i.key_pressed(egui::Key::Escape) {
                 self.should_close = true;
             }
+            // Ctrl+Tab is its own binding, not "Tab, with Ctrl held": without
+            // the guard, one Ctrl+Tab press cycles the channel *and* the
+            // search mode, since `key_pressed` ignores modifiers entirely.
             if i.key_pressed(egui::Key::Tab) {
-                self.cycle_mode();
-            }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Tab) {
-                self.cycle_channel();
+                if i.modifiers.ctrl {
+                    self.cycle_channel();
+                } else {
+                    self.cycle_mode();
+                }
             }
             if i.key_pressed(egui::Key::ArrowDown) && !self.results.is_empty() {
                 self.selected = (self.selected + 1).min(self.results.len() - 1);
@@ -661,8 +733,18 @@ impl eframe::App for App {
                 self.move_selection_into_view = true;
             }
         });
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.launch_selected();
+        // Ctrl+Enter (or Shift+Enter) opens the package in a terminal instead
+        // of running its main program — same hit, different thing to do with
+        // it. Checked together so a modified Enter doesn't also trigger the
+        // plain one, for the same reason as Ctrl+Tab above.
+        let enter = ctx.input(|i| {
+            i.key_pressed(egui::Key::Enter)
+                .then(|| i.modifiers.ctrl || i.modifiers.shift)
+        });
+        match enter {
+            Some(true) => self.open_terminal_selected(),
+            Some(false) => self.launch_selected(),
+            None => {}
         }
 
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
@@ -724,7 +806,9 @@ impl eframe::App for App {
             ui.add_space(4.0);
             self.draw_results_list(ui);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.weak("Enter launch · Tab mode · Ctrl+Tab channel · Esc close");
+                ui.weak(
+                    "Enter launch · Ctrl+Enter terminal · Tab mode · Ctrl+Tab channel · Esc close",
+                );
             });
         });
     }
@@ -743,6 +827,18 @@ fn elevated(visuals: &egui::Visuals, base: egui::Color32, delta: u8) -> egui::Co
         }
     };
     egui::Color32::from_rgb(adj(base.r()), adj(base.g()), adj(base.b()))
+}
+
+/// Renders a shell command as wrapped `ui.code` tokens. Same overflow
+/// hazard as everything else in the detail panel: a command line is one
+/// long unbroken string, and handing it to the panel's scroll area as a
+/// single wide Label would balloon the panel's width instead of wrapping.
+fn command_preview(ui: &mut egui::Ui, cmd: &str) {
+    ui.horizontal_wrapped(|ui| {
+        for token in cmd.split(' ').filter(|t| !t.is_empty()) {
+            ui.code(token);
+        }
+    });
 }
 
 /// A `ui.code(text)` pill that truncates (ellipsis) instead of overflowing.

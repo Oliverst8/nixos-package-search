@@ -162,7 +162,7 @@ without the one screen that must appear instantly depending on the network.
 Entries are deduplicated by attribute name (most recent wins, and carries
 the mode you last used), and the list is capped at 50.
 
-### History icons
+### Icons
 
 Since index schema 52 each package document carries
 `package_desktop_icons` — a `{ icon name: "<md5>.<png|svg>" }` map of files
@@ -171,13 +171,33 @@ same way. That map is the only reason icons are possible here at all: a
 package's icon otherwise lives inside a store path that doesn't exist until
 you've built the package.
 
-History entries store the whole index document, so the icon reference comes
-along for free. The file itself is fetched once and cached in
+Search results and history rows both get them. History entries store the
+whole index document, so the icon reference comes along for free. The file
+itself is fetched once and cached in
 `$XDG_CACHE_HOME/nixos-package-search/icons/` (`~/.cache/...`) — cache
-rather than state, since every one of them can be downloaded again. Fetching
-and decoding happen on a worker thread, so the history list is on screen
-before any of it starts; measured against the previous build, icons cost
-nothing at startup (84 ms vs 89 ms median to window-on-screen).
+rather than state, since every one of them can be downloaded again.
+
+**Nothing waits for an icon.** Rows are drawn immediately with a placeholder
+and the icon is swapped in when it arrives, loaded by a small pool of worker
+threads (`ICON_WORKERS`). That ordering is the whole design, and it was
+measured rather than assumed — for a cold search needing ten icons:
+
+| | time to results on screen | time until every icon is shown |
+|---|---|---|
+| no icons at all | 249 ms | — |
+| load icons, *then* show results | 1634 ms | (already there) |
+| placeholder + swap, one worker | 266 ms | ~2.6 s |
+| **placeholder + swap, four workers** | **266 ms** | **~584 ms** |
+
+(Medians of three runs each; the search round trip itself is 230–370 ms.)
+With a warm cache all variants are indistinguishable — ten cached icons cost
+about 33 ms total, well inside the search request's own variance — so the
+only thing the pool is buying is how fast a *cold* set fills in. One cold
+icon is ~230 ms, almost entirely network wait, which is why four at a time
+helps so much and why doing them before the first paint costs 1.4 s.
+
+Startup is unaffected too: 84 ms vs 89 ms median to window-on-screen,
+measured against the build before icons existed.
 
 Roughly 57% of the icons in the index are PNG and 43% SVG, so both are
 decoded: PNG through `image` (already in the dependency tree via
@@ -186,10 +206,16 @@ and SVG through `resvg` built **without** its text/font features — 11 new
 crates instead of 30, on the grounds that an application icon is shapes
 rather than text.
 
-A package with no icon is the normal case for CLI tools, which have no
-desktop entry: those get their initial in a faint chip, so the column stays
-aligned instead of leaving a hole. History entries recorded before schema 52
-have no icon reference either and look the same until you launch them again.
+Coverage is bimodal, so the column adapts. About 27% of results carry an
+icon, but per query it is close to all or nothing: "image editor" and
+"video player" have one on every visible row, while "firefox", "chrome",
+"python" and "pdf" have none at all (Firefox genuinely has no icon in the
+index). A package with no icon — the normal case for CLI tools, which have
+no desktop entry — gets its initial in a faint chip so a mixed list stays
+aligned; a result set with *no* icons anywhere drops the column entirely
+rather than showing a row of identical initials. History entries recorded
+before schema 52 have no icon reference either, and look the same until you
+launch them again.
 
 A launch is only recorded once it's got somewhere: in app mode that means
 after the child has survived its first moments, so a typo'd attribute or a

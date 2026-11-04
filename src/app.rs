@@ -4,14 +4,20 @@ use crate::launch;
 use crate::search::{self, SearchMode, CHANNELS};
 use crate::types::PackageHit;
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// How many icons are fetched at once. Enough to hide the latency of a
+/// screenful, few enough to stay polite to search.nixos.org.
+const ICON_WORKERS: usize = 4;
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long focus must stay lost before we auto-close. Guards against
@@ -81,12 +87,22 @@ pub struct App {
 
     /// Decoded icons by index file name, `None` once we've tried and found
     /// there's nothing to draw (a CLI tool with no desktop entry, a 404, an
-    /// entry recorded before the index carried icons). `icon_queue` holds
-    /// the files not yet asked for; it's drained into a worker thread from
-    /// the first frame, because loading them touches the network and the
-    /// disk and the history list has to be on screen before either.
+    /// entry recorded before the index carried icons).
+    ///
+    /// `icon_queue` is the work still to do, shared with the workers that
+    /// drain it, and `icon_requested` remembers every file ever put on it so
+    /// a package that keeps reappearing as you type is only fetched once.
+    /// Loading never happens on the way to a frame: results and history are
+    /// on screen first, icons land in later frames.
     icon_textures: HashMap<String, Option<egui::TextureHandle>>,
-    icon_queue: Vec<String>,
+    icon_queue: Arc<Mutex<VecDeque<String>>>,
+    icon_requested: HashSet<String>,
+    icon_workers: Arc<AtomicUsize>,
+    /// Whether anything in `results` has an icon at all. A search like
+    /// "firefox" matches nothing with a desktop entry, and a column of
+    /// identical placeholder initials down the side of it is worse than no
+    /// column: the space is only taken when there's something to put in it.
+    rows_have_icons: bool,
     icon_tx: Sender<(String, Option<icons::Rgba>)>,
     icon_rx: Receiver<(String, Option<icons::Rgba>)>,
 }
@@ -129,7 +145,10 @@ impl App {
             history: Vec::new(),
             showing_history: false,
             icon_textures: HashMap::new(),
-            icon_queue: Vec::new(),
+            icon_queue: Arc::new(Mutex::new(VecDeque::new())),
+            icon_requested: HashSet::new(),
+            icon_workers: Arc::new(AtomicUsize::new(0)),
+            rows_have_icons: false,
             icon_tx,
             icon_rx,
         }
@@ -154,40 +173,92 @@ impl App {
         self.selected = 0;
         self.hovered = None;
 
+        self.queue_row_icons();
+    }
+
+    /// Queues the icons for whatever is in `results` now — history or search
+    /// hits, they're the same rows.
+    ///
+    /// Anything still pending from the previous result set is dropped first
+    /// (and un-requested, so it can come back if those rows do): with the
+    /// workers taking the queue in order, a stale set sitting in front would
+    /// delay the icons for the rows actually on screen by its whole length.
+    fn queue_row_icons(&mut self) {
+        // Known from the index data, not from what has loaded, so the column
+        // doesn't appear or vanish as icons arrive.
+        self.rows_have_icons = self
+            .results
+            .iter()
+            .any(|hit| icons::icon_file(hit).is_some());
+
+        let mut queue = self.icon_queue.lock().expect("icon queue poisoned");
+        for stale in queue.drain(..) {
+            self.icon_requested.remove(&stale);
+        }
         for hit in &self.results {
             if let Some(file) = icons::icon_file(hit) {
                 if !self.icon_textures.contains_key(file)
-                    && !self.icon_queue.iter().any(|q| q == file)
+                    && self.icon_requested.insert(file.to_string())
                 {
-                    self.icon_queue.push(file.to_string());
+                    queue.push_back(file.to_string());
                 }
             }
         }
     }
 
-    /// Hands whatever icons we don't have yet to one worker thread. One
-    /// thread rather than one per icon: a cached icon is a file read, an
-    /// uncached one is a small HTTP GET on a connection the client already
-    /// pools, and a history list is a handful of rows.
+    /// Tops the worker pool up to [`ICON_WORKERS`] while there's work.
+    ///
+    /// A few workers rather than one: an icon is a small HTTP GET that is
+    /// almost entirely waiting, so a cold screenful fetched one after the
+    /// other is seconds of icons visibly trickling in (measured 2.6s for ten
+    /// of them, against 0.6s at four at a time). A pool rather than threads
+    /// per search: typing fires a search per pause, and each one would
+    /// otherwise start its own batch.
     fn spawn_icon_loader(&mut self, ctx: &egui::Context) {
-        if self.icon_queue.is_empty() {
-            return;
-        }
-        let files = std::mem::take(&mut self.icon_queue);
-        let client = self.client.clone();
-        let tx = self.icon_tx.clone();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            for file in files {
-                let loaded = icons::load(&client, &file);
-                if tx.send((file, loaded)).is_err() {
-                    return;
-                }
-                // The popup is idle while this runs; without this the icon
-                // would only appear on the next keystroke or mouse move.
-                ctx.request_repaint();
+        loop {
+            if self
+                .icon_queue
+                .lock()
+                .expect("icon queue poisoned")
+                .is_empty()
+            {
+                return;
             }
-        });
+            // Claim a slot before spawning, so two frames in quick
+            // succession can't both decide there's room for the same one.
+            let claimed =
+                self.icon_workers
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                        (active < ICON_WORKERS).then_some(active + 1)
+                    });
+            if claimed.is_err() {
+                return;
+            }
+
+            let queue = Arc::clone(&self.icon_queue);
+            let workers = Arc::clone(&self.icon_workers);
+            let client = self.client.clone();
+            let tx = self.icon_tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                loop {
+                    let next = queue.lock().expect("icon queue poisoned").pop_front();
+                    let Some(file) = next else {
+                        workers.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    };
+                    let loaded = icons::load(&client, &file);
+                    if tx.send((file, loaded)).is_err() {
+                        workers.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+                    // The popup is idle while this runs; without this the
+                    // icon would only appear on the next keystroke or mouse
+                    // move.
+                    ctx.request_repaint();
+                }
+            });
+        }
     }
 
     /// Uploads decoded icons as textures. Keyed by file name, so the same
@@ -637,11 +708,9 @@ impl App {
                     ui.set_min_width(ui.available_width());
                     // A `Frame`'s contents lay out top-down, so the icon
                     // needs an explicit left-to-right region to sit *beside*
-                    // the text rather than above it. The icon column only
-                    // exists on history rows; search results keep the full
-                    // width they always had.
+                    // the text rather than above it.
                     ui.horizontal_top(|ui| {
-                        if launched_as.is_some() {
+                        if self.rows_have_icons {
                             self.draw_icon_slot(ui, &self.results[idx]);
                         }
                         ui.vertical(|ui| {
@@ -892,6 +961,7 @@ impl eframe::App for App {
                         self.showing_history = false;
                         self.selected = 0;
                         self.hovered = None;
+                        self.queue_row_icons();
                     }
                     Err(e) => self.error = Some(e),
                 }

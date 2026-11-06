@@ -86,6 +86,43 @@ $ nix develop -c cargo run   # dev loop (fast incremental rebuilds)
   first one actually installed out of ghostty, kitty, foot, alacritty,
   wezterm, konsole, gnome-terminal, xfce4-terminal, terminator, urxvt, st,
   xterm. Set `$TERMINAL` if that guess picks the wrong one.
+- **Ctrl+C** copies the hovered/selected package's **attribute name** —
+  `ripgrep`, `python313Packages.requests` — which is the string that goes in
+  a configuration, not the pname or the binary name. The popup closes
+  immediately, the same as launching does, and a desktop notification says
+  what was copied — several results often have nearly the same name
+  (`firefox`, `firefox-unwrapped`, `firefox-esr-153-unwrapped`), and by the
+  time there's something to read there's no window left to read it in. The
+  notification needs `notify-send` and something listening for it; without
+  either, the copy still happens silently. Handy for using this purely as a
+  search tool: find the package, Ctrl+C, paste it into your own config.
+
+  The copy is handed to `wl-copy` (or `xclip`/`xsel` on X11) rather than
+  kept in the app, because **a Wayland clipboard only lives as long as the
+  client that owns it** — and copying is normally followed by switching to
+  the window you want to paste into, which makes this popup lose focus and
+  close — and now closes on copy regardless. `wl-copy` forks a small process
+  that keeps serving the selection after the popup is gone, which is what a
+  clipboard manager would otherwise do for you. If none of those helpers is
+  installed it falls back to the app's own clipboard, which in that case
+  only survives if you *do* have a clipboard manager running.
+
+  That helper does not pile up. Only one client can own the selection, so
+  each copy's helper replaces the previous one, which exits the moment it
+  loses ownership — eight copies in a row measured exactly one live helper
+  throughout, at 218 KB PSS (1 MB RSS, one thread, five fds). It is
+  reparented to init, so it leaves no zombie, and it lives until the next
+  copy from any application, because at that point it *is* your clipboard.
+  The handoff is only a spawn and a write — **0.7 ms** — and then the window
+  goes: **37 ms** from keypress to the compositor reporting the window gone,
+  which is a frame or two of scheduling rather than anything this program
+  does. It deliberately does not wait for the helper to finish taking the
+  selection, which is another ~135 ms of pure waiting. That wait looks
+  necessary and isn't: the helper is `setsid`-detached with the text already
+  in its stdin buffer, so nothing it has left to do depends on this process
+  existing. The one visible consequence is that for ~135 ms after the popup
+  disappears the clipboard still holds what it held before — far less than
+  it takes to switch windows and paste.
 - **Tab** switches between *Packages* search (name + description) and
   *Programs* search (search by the binary a package provides — e.g. typing
   `rg` finds `ripgrep`).
@@ -320,6 +357,8 @@ on what you need:
 
 - `src/search.rs` — Elasticsearch query building + HTTP client, channel list
 - `src/types.rs` — response deserialization
+- `src/clipboard.rs` — copying a name so it outlives the popup
+- `src/notify.rs` — the desktop notification saying what was copied
 - `src/history.rs` — launch history: XDG state file, load/record/save
 - `src/icons.rs` — history icons: index icon lookup, XDG cache, PNG/SVG decode
 - `src/launch.rs` — builds and spawns the `nix-shell` launch commands

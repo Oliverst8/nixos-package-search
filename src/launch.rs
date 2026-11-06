@@ -304,7 +304,7 @@ pub fn find_terminal() -> Option<FoundTerminal> {
 /// `which`, basically: an explicit path is taken as-is, a bare name is
 /// looked up in `$PATH`. Checked for the executable bit so a same-named
 /// data file or directory on `$PATH` doesn't shadow a real terminal.
-fn resolve_binary(name: &str) -> Option<PathBuf> {
+pub fn resolve_binary(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let executable = |p: &PathBuf| {

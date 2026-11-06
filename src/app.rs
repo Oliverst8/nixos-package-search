@@ -1,6 +1,8 @@
+use crate::clipboard;
 use crate::history::{self, LaunchMode};
 use crate::icons;
 use crate::launch;
+use crate::notify;
 use crate::search::{self, SearchMode, CHANNELS};
 use crate::types::PackageHit;
 use eframe::egui;
@@ -420,6 +422,31 @@ impl App {
                 self.error = Some(format!("failed to launch {}: {e}", hit.pname));
             }
         }
+    }
+
+    /// Copies the attribute name of whatever row is under the cursor (or
+    /// selected) — `ripgrep`, `python313Packages.requests` — which is the
+    /// string you would put in a configuration, not the pname or the binary.
+    ///
+    /// Copying closes the popup, like launching does: the name is on the
+    /// clipboard and the next thing you do with it is in another window.
+    /// What was copied is said in a desktop notification rather than in the
+    /// app, since by then there's no app left to say it in.
+    ///
+    /// Nothing is waited for on the way out: handing the text to the
+    /// clipboard helper costs 0.7 ms and the helper finishes on its own
+    /// afterwards, so the window goes as soon as the frame does.
+    fn copy_selected_name(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.active_index() else {
+            return;
+        };
+        let Some(hit) = self.results.get(idx) else {
+            return;
+        };
+        let name = hit.attr_name.clone();
+        notify::send(&format!("Copied {name}"));
+        clipboard::copy(ctx, &name);
+        self.should_close = true;
     }
 
     /// Terminal mode: hands the package to a terminal emulator sitting in its
@@ -1031,6 +1058,22 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
 
+        // Ctrl+C doesn't arrive as a key at all: egui-winit turns the
+        // platform's copy shortcut into a semantic `Event::Copy` before egui
+        // ever sees a `Key::C`, so matching on the key finds nothing. The
+        // event is taken out of the queue rather than merely observed,
+        // because the search box holds focus at all times and would
+        // otherwise handle the same event as "copy the selected query
+        // text", overwriting the name we just put on the clipboard.
+        let copy_pressed = ctx.input_mut(|i| {
+            let found = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            i.events.retain(|e| !matches!(e, egui::Event::Copy));
+            found
+        });
+        if copy_pressed {
+            self.copy_selected_name(ctx);
+        }
+
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
                 self.should_close = true;
@@ -1078,6 +1121,9 @@ impl eframe::App for App {
             None => {}
         }
 
+        // The copy flash is the one thing that closes the popup on a timer
+        // rather than on an event, so it needs to keep asking for frames
+        // while it's up — nothing else is happening to produce them.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused {
             self.gained_focus = true;
@@ -1129,6 +1175,19 @@ impl eframe::App for App {
             });
         }
 
+        // Its own panel rather than a `bottom_up` layout inside the central
+        // one: that drew the line *over* the bottom of the results list
+        // instead of reserving room for it, which was survivable while the
+        // line was short and isn't now.
+        egui::Panel::bottom("key_hints").show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.weak(
+                "Enter run · Ctrl+Enter terminal · Ctrl+Alt+Enter terminal+run · \
+                 Ctrl+C copy name · Tab mode · Ctrl+Tab channel · Esc close",
+            );
+            ui.add_space(2.0);
+        });
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(6.0);
             self.draw_top_bar(ui);
@@ -1136,12 +1195,6 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(4.0);
             self.draw_results_list(ui);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.weak(
-                    "Enter run · Ctrl+Enter terminal · Ctrl+Alt+Enter terminal+run · \
-                     Tab mode · Ctrl+Tab channel · Esc close",
-                );
-            });
         });
     }
 }

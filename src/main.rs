@@ -1,7 +1,9 @@
 mod app;
+mod clipboard;
 mod history;
 mod icons;
 mod launch;
+mod notify;
 mod search;
 mod types;
 
